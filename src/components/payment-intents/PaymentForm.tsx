@@ -21,8 +21,6 @@ import {
   Stack,
   Tab,
   TabList,
-  TabPanel,
-  TabPanels,
   Tabs,
   Text,
 } from '@chakra-ui/react';
@@ -126,6 +124,22 @@ export const PaymentForm: FC<PaymentFormProps> = ({ paymentToken }) => {
   const sendReceipt = watch('sendReceipt');
   const amount = watch('amount');
 
+  const submitFieldsOnlyHandler = async () => {
+    setLoading(true);
+    try {
+      const { error } = await window.gravityLegal.submitFields();
+      if (error) {
+        console.log('submitFields error:', error);
+      } else {
+        console.log('submitFields succeeded (no complete-payment call)');
+      }
+    } catch (e) {
+      console.log('submitFields error: ', e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
     const cents = currency(amount || '0', { errorOnInvalid: false }).intValue;
 
@@ -223,6 +237,7 @@ export const PaymentForm: FC<PaymentFormProps> = ({ paymentToken }) => {
 
               <Divider />
 
+              {/* Partners tend to hide inputs rather than remove them from the dom */}
               <Tabs
                 colorScheme='blue'
                 index={formType === 'card' ? 0 : 1}
@@ -233,69 +248,75 @@ export const PaymentForm: FC<PaymentFormProps> = ({ paymentToken }) => {
                   <Tab>Card</Tab>
                   <Tab>Bank Account</Tab>
                 </TabList>
-                <TabPanels mt={2}>
-                  <TabPanel px={0}>
-                    <Stack spacing='5'>
-                      <HostedFieldInput
-                        id='card-number'
-                        label='Card Number'
-                        fieldState={hostedFieldsState?.fields.cardNumber}
-                        rightElement={
-                          <InputRightElement pointerEvents='none' p={2} w={14}>
-                            <CreditCardBrandIcon
-                              className='w-full'
-                              brand={hostedFieldsState?.cardData?.brand}
-                            />
-                          </InputRightElement>
-                        }
-                      />
-                      {hostedFieldsState?.surcharging.willBeApplied && (
-                        <Alert status='info'>
-                          <AlertIcon />
-                          <AlertDescription>
-                            A fee of{' $'}
-                          {(
-                            hostedFieldsState.surcharging.amount!.fee / 100
-                          ).toFixed(2)}{' '}
-                          will be added to your total.
-                          </AlertDescription>
-                        </Alert>    
-                      )}
-                      <HostedFieldInput
-                        id='card-exp'
-                        label='Exp'
-                        fieldState={
-                          hostedFieldsState?.fields.cardExpirationDate
-                        }
-                      />
-                      <HostedFieldInput
-                        id='card-cvv'
-                        label='CVV'
-                        fieldState={hostedFieldsState?.fields.cardSecurityCode}
-                      />
-                    </Stack>
-                  </TabPanel>
-                  <TabPanel px={0}>
-                    <Stack spacing='5'>
-                      <HostedFieldInput
-                        id='account-holder-name'
-                        label='Account Name'
-                        fieldState={hostedFieldsState?.fields.accountHolderName}
-                      />
-                      <HostedFieldInput
-                        id='account-number'
-                        label='Account Number'
-                        fieldState={hostedFieldsState?.fields.accountNumber}
-                      />
-                      <HostedFieldInput
-                        id='routing-number'
-                        label='Routing Number'
-                        fieldState={hostedFieldsState?.fields.routingNumber}
-                      />
-                    </Stack>
-                  </TabPanel>
-                </TabPanels>
               </Tabs>
+              <Stack mt={2} spacing='5'>
+                <Box hidden={formType !== 'card'}>
+                  <HostedFieldInput
+                    id='card-number'
+                    label='Card Number'
+                    fieldState={hostedFieldsState?.fields.cardNumber}
+                    rightElement={
+                      <InputRightElement pointerEvents='none' p={2} w={14}>
+                        <CreditCardBrandIcon
+                          className='w-full'
+                          brand={hostedFieldsState?.cardData?.brand}
+                        />
+                      </InputRightElement>
+                    }
+                  />
+                </Box>
+                {hostedFieldsState?.surcharging.willBeApplied && (
+                  <Box hidden={formType !== 'card'}>
+                    <Alert status='info'>
+                      <AlertIcon />
+                      <AlertDescription>
+                        A fee of{' $'}
+                        {(
+                          hostedFieldsState.surcharging.amount!.fee / 100
+                        ).toFixed(2)}{' '}
+                        will be added to your total.
+                      </AlertDescription>
+                    </Alert>
+                  </Box>
+                )}
+                <Box hidden={formType !== 'card'}>
+                  <HostedFieldInput
+                    id='card-exp'
+                    label='Exp'
+                    fieldState={
+                      hostedFieldsState?.fields.cardExpirationDate
+                    }
+                  />
+                </Box>
+                <Box hidden={formType !== 'card'}>
+                  <HostedFieldInput
+                    id='card-cvv'
+                    label='CVV'
+                    fieldState={hostedFieldsState?.fields.cardSecurityCode}
+                  />
+                </Box>
+                <Box hidden={formType !== 'ach'}>
+                  <HostedFieldInput
+                    id='account-holder-name'
+                    label='Account Name'
+                    fieldState={hostedFieldsState?.fields.accountHolderName}
+                  />
+                </Box>
+                <Box hidden={formType !== 'ach'}>
+                  <HostedFieldInput
+                    id='account-number'
+                    label='Account Number'
+                    fieldState={hostedFieldsState?.fields.accountNumber}
+                  />
+                </Box>
+                <Box hidden={formType !== 'ach'}>
+                  <HostedFieldInput
+                    id='routing-number'
+                    label='Routing Number'
+                    fieldState={hostedFieldsState?.fields.routingNumber}
+                  />
+                </Box>
+              </Stack>
 
               <Stack spacing={2}>
                 <Checkbox {...register('savePaymentMethod')}>
@@ -318,9 +339,19 @@ export const PaymentForm: FC<PaymentFormProps> = ({ paymentToken }) => {
                 </ControlledCheckbox>
               </Stack>
               <Stack spacing='6'>
-                <Button colorScheme='blue' type='submit' variant='solid'>
-                  Run payment
-                </Button>
+                <Stack direction='row' spacing={2}>
+                  <Button colorScheme='blue' type='submit' variant='solid'>
+                    Run payment
+                  </Button>
+                  <Button
+                    type='button'
+                    variant='outline'
+                    colorScheme='gray'
+                    onClick={submitFieldsOnlyHandler}
+                  >
+                    Submit fields only (test)
+                  </Button>
+                </Stack>
               </Stack>
             </Stack>
           </form>

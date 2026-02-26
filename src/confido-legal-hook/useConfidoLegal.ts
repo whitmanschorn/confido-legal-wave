@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChangeEvent, HostedFieldsState } from './ConfidoLegal';
 
 export interface Params {
@@ -17,9 +17,8 @@ type UseConfidoLegalReturn = {
 };
 
 export const useConfidoLegal = (params: Params): UseConfidoLegalReturn => {
-  const memoizedParams = useMemo(
+  const initParams = useMemo(
     () => ({
-      formType: params.formType,
       paymentToken: params.paymentToken,
       savePaymentMethodToken: params.savePaymentMethodToken,
       surchargingOptions: {
@@ -28,7 +27,6 @@ export const useConfidoLegal = (params: Params): UseConfidoLegalReturn => {
       },
     }),
     [
-      params.formType,
       params.paymentToken,
       params.savePaymentMethodToken,
       params.surchargingOptions?.principalAmount,
@@ -62,9 +60,9 @@ export const useConfidoLegal = (params: Params): UseConfidoLegalReturn => {
     };
 
     hf.init({
-      paymentToken: memoizedParams.paymentToken,
-      savePaymentMethodToken: memoizedParams.savePaymentMethodToken,
-      activeForm: memoizedParams.formType,
+      paymentToken: initParams.paymentToken,
+      savePaymentMethodToken: initParams.savePaymentMethodToken,
+      activeForm: params.formType,
       fields: {
         accountNumber: {
           containerId: 'account-number',
@@ -91,11 +89,20 @@ export const useConfidoLegal = (params: Params): UseConfidoLegalReturn => {
           style: fieldStyle,
         },
       },
-      surchargingOptions: memoizedParams.surchargingOptions,
+      surchargingOptions: initParams.surchargingOptions,
     });
 
     return () => hf.removeChangeListener(listener);
-  }, [memoizedParams]);
+  }, [initParams]);
+
+  const isInitialMount = useRef(true);
+  useEffect(() => {
+    if (isInitialMount.current) {
+      isInitialMount.current = false;
+      return;
+    }
+    window.gravityLegal.setActiveForm(params.formType);
+  }, [params.formType]);
 
   return {
     hf: window.gravityLegal,
