@@ -102,7 +102,7 @@ Selectors the app exposes (there are **no** `data-testid`s in the app; use roles
 | Sign up | labels `Firm name`, `Username`, `Password`; button `Sign up`/submit |
 | Login | labels `Username`, `Password`; submit |
 | Home (unconnected) | heading `Let's get started 🚀`; accordion buttons `Connect`, `Sign Up Link`, `Onboarding.js`; link text = connect URL; buttons `Sign Up For Confido Legal`, `Apply Now!` |
-| Home (connected) | text `Connected to Confido Legal ✅`; badge `Ready` or `Pending`; button `Disconnect`; button `Complete application` (pending only); heading `Let's collect some money 💸🤑` (ready only); three cards `Payment Intents`, `Stored Payment Methods`, `Payment Links` with `Try it out` |
+| Home (connected) | text `Connected to Confido Legal ✅`; badge `Ready` or `Pending` — **must use `getByText('Ready', { exact: true })`**, because the status sentence above the badge also contains the word (`Your payments application is approved…` / `…is pending…`), so a loose match is a strict-mode violation; button `Disconnect`; button `Complete application` (pending only); heading `Let's collect some money 💸🤑` (ready only); three cards `Payment Intents`, `Stored Payment Methods`, `Payment Links` with `Try it out` |
 | Sidebar | `Home`, `Payment Intents`, `Stored Payment Methods`, `Clients` |
 | Payment Intents | label `Amount` (placeholder `$10.00`), `Name` (input id `name`), `Email for receipt`; tabs `Card`, `Bank Account`; checkboxes `Store payment method` and `Send receipt (...)`; submit button **`Run payment`** (plus a second button `Submit fields only (test)`); hosted-field labels `Card Number`, `Exp`, `CVV`, `Account Name`, `Account Number`, `Routing Number`; result heading `Success!`; `Lookup Pay Request by External ID` box with `Lookup` button; modal heading `Pay Request Data`; `Collect more`. Surcharge notice text is `a 3% surcharging fee will be added`, plus an alert `A fee of $X.XX will be added to your total.` |
 | Paylinks | label `Amount` (renders **no** value — the amount is printed as a bare `<Text>` above it), `Email for receipt`, tabs, checkbox `Store payment method`, submit button `Run payment` |
@@ -252,7 +252,7 @@ spms: Map<id, { firmId, lastFour, cardBrand, paymentMethod, payerName }>
 |---|---|
 | `Query.me` (partner) | `{ partner }` |
 | `Query.firm` (firm) | `{ id, name, isAcceptingPayments }` |
-| `Query.client(id)` (firm) | from store or GraphQL error `Client not found` |
+| `Query.client(id)` (firm) | from store, else `USER_INPUT_ERROR` `Client with id(<uuid>) not found.` (§0.1 wording wins over the looser `Client not found` written here originally) |
 | `Query.payRequestList(input{externalId, firmId})` | payments with that `externalId` → `[{ externalId, transactions:[{ id, status_v2:'SUCCESSFUL' }] }]` |
 | `Mutation.createFirm(input{name, mockOnboarding})` (partner) | new firm; `status = mockOnboarding ? ACTIVE : CREATED`; `isAcceptingPayments = mockOnboarding`; returns `apiToken`, `onboardingToken{token,expiresAt}`, `signUpLink{ link: ${MOCK}/app/signup/<code>, expiresAt }` |
 | `Mutation.createFirmSignUpLink` (firm) | new link for that firm |
@@ -263,14 +263,26 @@ spms: Map<id, { firmId, lastFour, cardBrand, paymentMethod, payerName }>
 | `Mutation.createSavePaymentMethodToken(input)` (firm) | `spm_public_mock_<n>` |
 | `Mutation.paymentSessionComplete(input)` (firm) | see decision table below |
 | `Mutation.completeSavePaymentMethod(input)` (firm) | requires staged instrument; returns `{ id, lastFour }`; stores SPM |
-| `Mutation.addClient(input{clientName, firmId})` (firm) | `firmId` must equal token's firm else error `Forbidden`; returns `{ id, clientName }` |
+| `Mutation.addClient(input{clientName, firmId})` (firm) | `firmId` must equal token's firm, else `USER_INPUT_ERROR` `Firm with id(<uuid>) not found.` (**not** `Forbidden` — §0.1 wins); returns `{ id, clientName }` |
+
+**Operation names the mock records** (what `/__control/events` matches on — these come from the
+`gql` documents in `src/confido-legal-requests/`, so spell them exactly):
+`GetMyPartner`, `GetFirm`, `GetClient`, `PayRequestList`, `CreateFirm`, `CreateFirmSignUpLink`,
+`CreateOnboardingToken`, `ExchangedCodeForFirmToken` (**note the app's typo — not `Exchange…`**,
+`src/confido-legal-requests/exchangeCodeForFirmToken.ts:6`), `DisconnectFromPartner`,
+`CreatePaymentToken`, `CreateSavePaymentMethodToken`, `PaymentSessionComplete`,
+`CompleteSavePaymentMethod`, `AddClient`.
+
+**Recorded `variables` are the raw wire variables.** For `CreateSavePaymentMethodToken` that means
+`{variables: {input: {}}}`, not `{input: {}}`, because the app passes an options wrapper where
+graphql-request expects variables (QUIRKS.md #5). Assert the malformed shape on purpose.
 
 `paymentSessionComplete` decision table (mirrors Confido's documented sandbox test values so the
 suite reads like their docs):
 
 | Staged instrument | Result |
 |---|---|
-| none staged (shim never submitted) | error `No payment method submitted for this session` |
+| none staged (shim never submitted) | CREDIT/DEBIT → error `binData is required for card payments` (§0.1 wins); ACH → `No payment method submitted for this session` |
 | session already used | error `Payment session already completed` |
 | card `4242424242424242` | `status:"success"`, one transaction `amountProcessed = amount` |
 | card `4000056655665556` | success, `paymentMethod` DEBIT |
