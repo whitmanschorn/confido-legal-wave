@@ -441,7 +441,75 @@ with zero credentials.
 
 ---
 
-## 9. Out of scope here (separate tracks, noted for later)
+## 9. Delegation map: how to split this across sub-agents
+
+The lead agent owns integration, the green run, and commits. Sub-agents own **disjoint files**.
+The contracts between them are already frozen in this document, so parallel work integrates:
+
+| Contract | Defined in | Consumed by |
+|---|---|---|
+| Control API routes and JSON shapes | §3.4 | shims, fixtures, specs |
+| Store record shapes | §3.2 | resolvers, control API, fake app |
+| `window.gravityLegal` / `window.confidoOnboarding` interfaces | §4 + `src/confido-legal-hook/ConfidoLegal.d.ts` | fixtures, specs |
+| Fixture names and return types | §5 | specs |
+| Env var names and ports | §2 | everything |
+
+If a sub-agent needs to change a contract, it must stop and report; the lead updates this file first,
+then work resumes. Contracts never change silently.
+
+### 9.1 Units of work and their ownership
+
+| Unit | Owns (exclusively) | Depends on | Parallel with |
+|---|---|---|---|
+| **S** store + types | `mock-server/store.ts`, `mock-server/types.ts` | nothing | — (do first, ~30 min, lead does it) |
+| **G** GraphQL layer | `mock-server/resolvers.ts`, `mocks.ts`, `events.ts`, the yoga part of `server.ts` | S | C, H, F |
+| **C** control API + fake app | `mock-server/control.ts`, `mock-server/fake-app/*` | S | G, H, F |
+| **H** shims | `shims/hosted-fields.js`, `shims/onboarding.js` | §3.4 contract only | G, C, F |
+| **F** fixtures + config | `playwright.config.ts`, `fixtures/*` | §3.4 + §4 contracts only | G, C, H |
+| **T1** specs: auth, home-connect, home-signup-link, home-onboarding | those four spec files | G, C, F running | T2, T3, T4 |
+| **T2** specs: payment-intents, paylinks | those two | G, C, H, F running | T1, T3, T4 |
+| **T3** specs: stored-payment-methods, clients, transactions | those three | same | T1, T2, T4 |
+| **T4** specs: owner-form, standing-link, webhooks, api-routes, network-isolation, contract-drift | those six | same | T1, T2, T3 |
+| **D** docs + CI | `README.md`, `QUIRKS.md` consolidation, `.github/workflows/e2e.yml` | all green | — (last) |
+
+`server.ts` is the only shared file: it imports `control.ts` and the yoga handler and mounts both.
+The lead writes its skeleton in Phase 0 with the two mount points stubbed; G and C fill in their
+modules and do not edit each other's.
+
+### 9.2 Scheduling
+
+```
+Phase 0  lead: scaffold, healthz, S (store + types), server.ts skeleton          serial
+Phase 1  fan out: G | C | H | F                                                   4 parallel sub-agents
+         lead: integrate, start servers, run T1 subset by hand until green
+Phase 2  fan out: T1 | T2 | T3 | T4                                               4 parallel sub-agents
+         lead: run full suite, triage, hand failures back to the owning agent
+Phase 3  lead: lockdown hardening, QUIRKS.md consolidation
+Phase 4  D (can be one sub-agent), lead pushes and watches CI
+```
+
+### 9.3 Rules that make parallel work safe
+
+1. **Only the lead starts the servers.** Ports 7001 and 7002 are single-occupancy. Sub-agents building
+   G/C/H/F verify with `npx tsc --noEmit -p e2e` and `node --check` on the shims; they do **not**
+   run `npm test`.
+2. **Spec sub-agents (T1–T4) run against the lead's already-running servers.** The lead starts them
+   once with `npm run mock &` and the Next build/start from §2 (or a first `npm test` with
+   `reuseExistingServer: true`, which leaves them up). Sub-agents then run only their own files:
+   `npx playwright test specs/<name>.spec.ts`. Concurrent Playwright runs against the shared servers
+   are safe because every test creates its own user and firm.
+3. **Read-only exploration is always allowed and encouraged.** Any agent may spawn an Explore
+   sub-agent with a question like "what accessible name does `CreditCardBrandIcon` render for Visa;
+   cite file and line" instead of guessing.
+4. **One writer per file.** If two units need the same file, the lead owns it.
+5. **Quirks go through the lead.** Sub-agents report a suspected quirk with file:line evidence;
+   the lead writes the `QUIRKS.md` entry so wording is consistent and duplicates are merged.
+6. **Sub-agents do not commit.** The lead commits at phase boundaries after the additive check.
+7. **Hand back format** for every sub-agent: files written, verification command run and its result,
+   any contract it wished were different, any quirk suspected (with evidence). No claims of "works"
+   without a command output to back it.
+
+## 10. Out of scope here (separate tracks, noted for later)
 
 * **Deploying the fork to Vercel.** SQLite on Vercel's read-only filesystem will not work; the
   deploy needs a hosted Prisma datasource (Postgres/Turso) which means editing `prisma/schema.prisma`,
