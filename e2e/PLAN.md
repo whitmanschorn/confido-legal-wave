@@ -12,6 +12,23 @@ Verification of the additive rule, run before every commit:
 git status --porcelain | grep -vE '^\?\? (e2e/|\.github/)' | grep -v '^ M e2e/' ; # must print nothing
 ```
 
+### 0.0 Hard constraint discovered in Phase 0: e2e code is type-checked by `next build`
+
+The root `tsconfig.json` has `"include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"]`, so `next build`
+type-checks everything under `e2e/` too — and we may not edit the root tsconfig. Therefore **every
+`.ts` file under `e2e/` must compile under the root config as well as under `e2e/tsconfig.json`**
+(root is `target: es5`, `moduleResolution: node`, `strict`, `isolatedModules`, no `downlevelIteration`).
+
+Rules that follow, and that every unit must obey:
+
+* **No iterator spread or `for…of` over a `Map`/`Set`.** Use `Array.from(map.values())` and
+  `map.forEach(...)`. (`[...map.values()]` is TS2802 under the root config.)
+* **Extensionless relative imports** (`./types`, not `./types.js`). `tsx` resolves these fine.
+* `import type` / `export type` for type-only bindings (`isolatedModules`).
+* No `for await`. Shims stay `.js` (the root `include` only matches `.ts`/`.tsx`, so they are exempt).
+* Verify with **both**: `npx tsc --noEmit` from `e2e/`, and `npx tsc --noEmit` from the repo root
+  (root output is clean; ignore nothing).
+
 If a test can only be made to pass by changing app code, **do not change the app**. Encode the
 current behaviour, tag the test with an annotation `{ type: 'quirk', description: '...' }`, and
 add a line to `e2e/QUIRKS.md`. Those quirks are findings we want to show the maintainers.
@@ -55,7 +72,7 @@ reproduce these shapes and messages verbatim; they override anything looser writ
 | Business-rule errors | **HTTP 200**, `data: null`, `extensions.code: "INTERNAL_SERVER_ERROR"`, messages below |
 | `firm` right after `createFirm(mockOnboarding:false)` | `status: "CREATED"`, `isAcceptingPayments: false` |
 | `me` with a **firm** token | `__typename: "Scope"` (only the partner token yields `me.partner`) |
-| `createFirmSignUpLink` | `link: "https://app.sandbox.confidolegal.com/signup?s_code=<32 hex>"`, `expiresAt` ≈ 20 min out. Mock: `${MOCK}/app/signup?s_code=<32 hex>` |
+| `createFirmSignUpLink` | `link: "https://app.sandbox.confidolegal.com/signup?s_code=<32 hex>"`, `expiresAt` ≈ 20 min out. **Mock (frozen): `${MOCK}/app/signup?s_code=<32 hex>`** — the query form, mirroring the real API. This overrides the `/app/signup/<code>` path form written in §3.3/§3.5 below; the fake app answers **both** shapes, but every minted link uses the query form, and `home-signup-link.spec` asserts the popup URL starts with `${MOCK}/app/signup`. |
 | `createOnboardingToken` | token prefix `onboarding_public_sandbox_`, expires ≈ 24 h |
 | `createPaymentToken(input:{})` on a non-active firm | error `no operating accounts exist` |
 | `createPaymentToken(input:{})` on an active firm | `paymentToken` prefix `pay_public_sandbox_` |
@@ -87,11 +104,12 @@ Selectors the app exposes (there are **no** `data-testid`s in the app; use roles
 | Home (unconnected) | heading `Let's get started 🚀`; accordion buttons `Connect`, `Sign Up Link`, `Onboarding.js`; link text = connect URL; buttons `Sign Up For Confido Legal`, `Apply Now!` |
 | Home (connected) | text `Connected to Confido Legal ✅`; badge `Ready` or `Pending`; button `Disconnect`; button `Complete application` (pending only); heading `Let's collect some money 💸🤑` (ready only); three cards `Payment Intents`, `Stored Payment Methods`, `Payment Links` with `Try it out` |
 | Sidebar | `Home`, `Payment Intents`, `Stored Payment Methods`, `Clients` |
-| Payment Intents | label `Amount` (placeholder `$10.00`), `Name` (input id `name`), `Email for receipt`; tabs `Card`, `Bank Account`; checkbox `savePaymentMethod`; submit; result heading `Success!`; `Lookup Pay Request by External ID` box with `Lookup` button; `Collect more` |
-| Paylinks | label `Amount` (read-only from link), `Email for receipt`, tabs, submit |
-| Stored Payment Methods | button `Save New Payment Method`; modal labels `Client name`, `Email`; tabs; submit; `Success!` |
-| Clients | button `Add client`; modal label `Client Name`; result heading `Added client`; button `Request client by id`; heading `Requested client` |
+| Payment Intents | label `Amount` (placeholder `$10.00`), `Name` (input id `name`), `Email for receipt`; tabs `Card`, `Bank Account`; checkboxes `Store payment method` and `Send receipt (...)`; submit button **`Run payment`** (plus a second button `Submit fields only (test)`); hosted-field labels `Card Number`, `Exp`, `CVV`, `Account Name`, `Account Number`, `Routing Number`; result heading `Success!`; `Lookup Pay Request by External ID` box with `Lookup` button; modal heading `Pay Request Data`; `Collect more`. Surcharge notice text is `a 3% surcharging fee will be added`, plus an alert `A fee of $X.XX will be added to your total.` |
+| Paylinks | label `Amount` (renders **no** value — the amount is printed as a bare `<Text>` above it), `Email for receipt`, tabs, checkbox `Store payment method`, submit button `Run payment` |
+| Stored Payment Methods | button `Save New Payment Method`; modal heading `Save a Payment Method`, text `Loading...` while the token is fetched, labels `Client name`, `Email`; tabs; buttons `Save` / `Cancel`; result heading `Success!` then `Close` |
+| Clients | button `Add client`; modal heading `Add a Client`, label `Client Name`, submit button `Add Client`; result heading `Added client`; button `Request client by id`; heading `Requested client` |
 | Transactions | static template: text `Showing 1 to 5 of 42 results`, 5 rows |
+| Card brand icon | `CreditCardBrandIcon` inlines an SVG via `@svgr/webpack` with **no** title, `alt` or `aria-label`. Distinguish by brand fill: visa `path[fill="#0E4595"]` (3 paths), mastercard `path[fill="#D9222A"]` (7 paths), generic `path[fill="#9D9400"]`. |
 | Owner form | `Invalid url` alert when no `o_code` |
 | Standing link iframe | `No standing link URL provided` |
 
@@ -278,6 +296,7 @@ POST /__control/connect/mint                   { name? } → creates ACTIVE firm
 GET  /__control/sessions/:token                { kind, paymentLink?, surchargingEnabled } (shim init) or 404
 POST /__control/sessions/:token/stage          body = instrument from shim submitFields
 POST /__control/onboarding/:token/submit       firm → APP_SUBMITTED
+POST /__control/paylinks/seed                  { id, totalAmount } → seeds the hardcoded Paylinks id (§0.1)
 GET  /healthz
 ```
 
@@ -512,9 +531,19 @@ then work resumes. Contracts never change silently.
 | **T4** specs: owner-form, standing-link, webhooks, api-routes, network-isolation, contract-drift | those six | same | T1, T2, T3 |
 | **D** docs + CI | `README.md`, `QUIRKS.md` consolidation, `.github/workflows/e2e.yml` | all green | — (last) |
 
-`server.ts` is the only shared file: it imports `control.ts` and the yoga handler and mounts both.
-The lead writes its skeleton in Phase 0 with the two mount points stubbed; G and C fill in their
-modules and do not edit each other's.
+`server.ts` is written **once, by the lead, in Phase 0** and never edited again. It does routing only
+and mounts two modules by a frozen interface:
+
+* `mock-server/graphql.ts` (unit **G**) — `export function isGraphQLPath(pathname: string): boolean`
+  and `export async function handleGraphQL(req, res): Promise<void>`. Reached for `/v2`, `/graphql`,
+  and `POST /`.
+* `mock-server/control.ts` (unit **C**) — `export async function handleControl(req, res): Promise<void>`.
+  Reached for everything else (`/__control/*`, `/app/*`, `/js/*`, `/iframe-target`, else 404).
+
+`server.ts` itself answers `GET /healthz` and `GET /`. Phase 0 lands both modules as stubs that G and
+C replace wholesale. The lead also wrote `mock-server/types.ts` (all shared type contracts) and
+`mock-server/events.ts` (`recordEvent` / `queryEvents` / `eventCount` / `resetEvents`) in Phase 0, so
+G and C share them read-only rather than negotiating.
 
 ### 9.2 Scheduling
 
