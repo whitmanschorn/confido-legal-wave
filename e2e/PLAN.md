@@ -41,6 +41,43 @@ add a line to `e2e/QUIRKS.md`. Those quirks are findings we want to show the mai
 | Node 24 works; `next build` passes on a clean clone. `tsc` fails only on `.svg` module declarations (pre-existing, ignore). | Nothing to do. |
 | Real schema is at `e2e/mock-server/schema.graphql` (4007 lines, dumped via unauthenticated introspection of `https://api.sandbox.gravity-legal.com/v2`). Scalars: `DateTimeISO JSON BigInt`. | Build the mock from this SDL so every response is type-correct. |
 
+### 0.1 Facts verified against the live sandbox API (2026-09-08)
+
+These were captured by running real requests with a throwaway sandbox firm token. The mock should
+reproduce these shapes and messages verbatim; they override anything looser written elsewhere in this file.
+
+| Situation | Real response |
+|---|---|
+| Unknown / malformed `x-api-key` | **HTTP 500**, body `{"errors":[{"message":"Context creation failed: Invalid firm token.","extensions":{"code":"INTERNAL_SERVER_ERROR"}}]}` (no `data` key) |
+| Revoked firm token (after `disconnectFromPartner`) | **HTTP 500**, message `Context creation failed: Token has been revoked.` |
+| No `x-api-key` at all | **HTTP 200**, `data: null`, error `Access denied! You don't have permission for this action!` with `path` |
+| Validation / not-found errors | **HTTP 200**, `data: null`, `extensions.code: "USER_INPUT_ERROR"`, e.g. `Client with id(<uuid>) not found.`, `Firm with id(<uuid>) not found.` |
+| Business-rule errors | **HTTP 200**, `data: null`, `extensions.code: "INTERNAL_SERVER_ERROR"`, messages below |
+| `firm` right after `createFirm(mockOnboarding:false)` | `status: "CREATED"`, `isAcceptingPayments: false` |
+| `me` with a **firm** token | `__typename: "Scope"` (only the partner token yields `me.partner`) |
+| `createFirmSignUpLink` | `link: "https://app.sandbox.confidolegal.com/signup?s_code=<32 hex>"`, `expiresAt` ≈ 20 min out. Mock: `${MOCK}/app/signup?s_code=<32 hex>` |
+| `createOnboardingToken` | token prefix `onboarding_public_sandbox_`, expires ≈ 24 h |
+| `createPaymentToken(input:{})` on a non-active firm | error `no operating accounts exist` |
+| `createPaymentToken(input:{})` on an active firm | `paymentToken` prefix `pay_public_sandbox_` |
+| `createPaymentToken(input:{paymentLinkId:"a1e7a82e-…"})` (the Paylinks page's hardcoded id), active or not | error `Paylink not found` → **the real Paylinks page 500s for every account but the author's.** Mock default must reproduce this; add control `POST /__control/paylinks/seed {id, totalAmount}` so a second test can seed that exact id and exercise the form. |
+| `createSavePaymentMethodToken` on a non-active firm | error `This firm is not active.` |
+| `createSavePaymentMethodToken` on an active firm | token prefix `spm_public_sandbox_` |
+| `paymentSessionComplete` with a valid token but no hosted-fields submission | error `binData is required for card payments` (use this text for "nothing staged" with method CREDIT/DEBIT) |
+| `paymentSessionComplete` with unknown token | error `PaymentSession not found` |
+| `completeSavePaymentMethod` with unknown token | error `SavePaymentMethodSession not found` |
+| `addClient` with a `firmId` that is not the token's firm | `USER_INPUT_ERROR` `Firm with id(<uuid>) not found.` |
+| `addClient` success | `{ id: <uuid>, clientName }`; `client(id)` returns `email: null, phone: null` when unset |
+| `payRequestList` for an unknown externalId | `[]` |
+| `disconnectFromPartner` | returns `{ id: <firmId> }` and **revokes the calling token immediately** (next call → `Token has been revoked.`) |
+| Legal Wave `GET /api/session` after the token was revoked out-of-band | verified on the hosted demo: the route catches the error, sets `firm.glApiToken` to `null` in the DB, and the response has no `glFirm`. Home then shows the connect splash again. This is the recovery path `api-routes.spec` must cover via `POST /__control/firms/:id/revoke-tokens`. |
+| `sandboxOnlyActivateFirm` (no args) with a **firm** token | works: firm → `status: "ACTIVE"`, `isAcceptingPayments: true`, default operating + trust accounts created. Mock control `activate` mirrors this real mutation. |
+| `bankAccountsList` | `{ bankAccounts: [BankAccount] }` — no `total`. `BankAccount` fields: `id accountHolderName accountType category("operating"\|"trust") isDefault isFeeAccount isChargebackAccount lastFour nickname routingNumber firmId` |
+
+Token prefixes for the mock: `p_secret_mock_`, `f_secret_mock_`, `pay_public_mock_`, `spm_public_mock_`, `onboarding_public_mock_`.
+
+Two additional quirks observed on the **hosted** demo (`confido-legal-wave.vercel.app`), to be asserted by `api-routes.spec` against the local build:
+`GET /api/session` returns the user's **plaintext password** (`user.password`) and the **Confido firm secret token** (`firm.glApiToken`) to the browser.
+
 Selectors the app exposes (there are **no** `data-testid`s in the app; use roles and labels):
 
 | Screen | Selectors |
@@ -170,8 +207,11 @@ command runs root scripts. Do **not** add a root script; document `npm --prefix 
 * Auth from `x-api-key`:
   * `p_secret_mock_partner` → partner context.
   * `f_secret_mock_<firmId>` → firm context if issued and not revoked.
-  * anything else / missing → HTTP **401** with `{ errors: [{ message: 'Unauthorized' }] }`.
-    (`/api/session` catches this and nulls the stored token — that path is a test.)
+  * anything else → reproduce the real shapes in §0.1: unknown token → HTTP **500** `Context creation failed: Invalid firm token.`;
+    revoked token → HTTP **500** `Context creation failed: Token has been revoked.`; missing header → HTTP **200**
+    with `data: null` and `Access denied! You don't have permission for this action!`.
+    (`graphql-request` throws on all three; `/api/session` catches and nulls the stored token — that path is a test.)
+  * Use `extensions.code: "USER_INPUT_ERROR"` for not-found/validation errors and `"INTERNAL_SERVER_ERROR"` for business-rule errors, matching §0.1.
 * Record every operation in `events.ts`: `{ ts, operationName, tokenKind, firmId, variables, ok, errorMessage }`.
 
 ### 3.2 Store (in memory, keyed so parallel tests never collide)
