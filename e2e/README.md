@@ -16,35 +16,77 @@ creates a Confido firm), #21 (the app server-renders nothing), #2 (the session e
 plaintext password and the Confido firm secret), #10 (Connect never round-trips a `state` parameter)
 and #25 (the standing-link page frames any URL a query parameter names).
 
-## Run it
+## Run it on a fresh machine
+
+Nothing but Node and a browser download. **No `.env` file, no Confido credentials, no accounts, no
+network access to Confido.** Verified from a clean clone on 2026-09-09 — the exact commands below,
+in order, ending in 119 passed.
+
+**Prerequisites:** Node **20+** (24 is what CI and local dev use; there is no `engines` field, so
+nothing enforces it), npm, and ports **7001** and **7002** free.
 
 ```bash
-npm ci                      # once, at the repo root — the suite builds the real app
-npm --prefix e2e ci
-npx --prefix e2e playwright install chromium
+git clone https://github.com/whitmanschorn/confido-legal-wave.git
+cd confido-legal-wave
+
+npm ci                                        # app deps; postinstall creates prisma/legal-wave.sqlite
+npm --prefix e2e ci                           # suite deps (its own package.json, not the root one)
+npx --prefix e2e playwright install chromium  # on Linux: add --with-deps (needs sudo)
+
 npm --prefix e2e test
 ```
 
-The first run takes a couple of minutes: Playwright's `webServer` resets the SQLite database, runs
-`next build` with the mock environment, and starts the app. Subsequent runs reuse the running servers
-locally (`reuseExistingServer`), and never do in CI.
+Expected, and what a green run looks like:
+
+```
+Running 120 tests using 3 workers
+...
+  1 skipped
+  119 passed (2.2m)
+```
+
+The first run takes ~2 minutes because Playwright's `webServer` resets the SQLite database, runs
+`next build` with the mock environment, and starts both servers. Locally, later runs reuse the
+running servers (`reuseExistingServer`) and take seconds; CI never reuses.
+
+**The one skip is intentional** — `contract-drift`'s live-introspection test, which needs network to
+Confido and is gated behind `CONFIDO_LIVE_INTROSPECT=1`. Everything else runs offline.
 
 | | |
 |---|---|
-| Legal Wave | `http://127.0.0.1:7001` (fixed in the root `package.json`) |
+| Legal Wave | `http://127.0.0.1:7001` (port fixed in the root `package.json`) |
 | Mock Confido API | `http://127.0.0.1:7002` |
 
 `127.0.0.1` everywhere, never `localhost` — they are different origins to a browser, and the lockdown
 fixture keys off the hostname.
 
-Useful variants:
+### Useful variants
 
 ```bash
-npm --prefix e2e run test:ui                          # Playwright UI mode
-npm --prefix e2e test -- specs/payment-intents.spec.ts # one spec
-npm --prefix e2e run mock                             # just the mock, for poking by hand
+npm --prefix e2e test -- specs/payment-intents.spec.ts   # one spec file
+npm --prefix e2e test -- -g "declined"                   # one test by name
+npm --prefix e2e run test:ui                             # Playwright UI / watch mode
+npm --prefix e2e run mock                                # just the mock, to poke by hand
 CONFIDO_LIVE_INTROSPECT=1 npm --prefix e2e test -- specs/contract-drift.spec.ts
 ```
+
+For the edit-run-edit loop, see [QA: the local TDD loop](#qa-the-local-tdd-loop) — starting the
+servers once yourself turns a 2-minute run into a 2-second one.
+
+### If it doesn't work
+
+| Symptom | Fix |
+|---|---|
+| `EADDRINUSE` on 7001 or 7002 | Something already holds the port: `lsof -ti:7001,7002 \| xargs kill -9`. Note `next start` spawns a `next-router-worker`, so killing by process name misses it — kill by port. |
+| `browserType.launch: Executable doesn't exist` | You skipped `playwright install chromium`, or ran it in the repo root instead of with `--prefix e2e` |
+| Missing shared libraries on Linux | `npx --prefix e2e playwright install --with-deps chromium` |
+| `next build` fails on a type error in `e2e/` | You are on a checkout without the `tsconfig.json` change; see *The one file changed outside `e2e/`* |
+| Suite tries to rebuild every run | Expected unless you started the servers yourself, or you have `CI=1` set |
+| Everything fails after you edited a `NEXT_PUBLIC_*` value | Those are inlined at build time — rebuild |
+
+A stray `.env.local` cannot break the suite: Playwright passes the mock environment explicitly to the
+`webServer`, and real `process.env` beats `.env.local` in Next, so a real sandbox URL sitting in an
+untracked env file will not leak into the run.
 
 ## How the mock works
 
@@ -110,11 +152,8 @@ rebuilds the app and takes ~2 minutes; a warm single-spec run takes ~2 seconds.
 
 ### 1. One-time setup
 
-```bash
-npm ci                                        # repo root — the suite builds the real app
-npm --prefix e2e ci
-npx --prefix e2e playwright install chromium
-```
+The three install commands from [Run it on a fresh machine](#run-it-on-a-fresh-machine). If
+`npm --prefix e2e test` already passes, you are set up.
 
 ### 2. Start the servers once and leave them up
 
