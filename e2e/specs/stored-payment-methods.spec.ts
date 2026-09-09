@@ -15,10 +15,19 @@
  *   5. replaces the whole body with `Success!`, the raw result JSON and a
  *      `Close` button (`…Modal.tsx:138-153`).
  *
- * Two quirks are pinned here on purpose:
+ * Note that step 1 happens on **page mount**, not on modal open: the page
+ * renders `<CreateStoredPaymentMethodModal>` unconditionally
+ * (`stored-payment-methods.tsx:16`) and the hook's `useEffect` has an empty
+ * dependency array. Two tests below pin that and its consequence.
+ *
+ * Quirks pinned here on purpose:
  *   • QUIRKS.md #5 — the token mutation's variables go on the wire malformed.
- *   • A new one — the token hook has no error path at all, so an unconnected
- *     firm gets a silently empty modal. See the last test.
+ *   • QUIRKS.md #14 — the token hook has no error path at all, so an
+ *     unconnected firm gets a silently empty modal. See the last two tests.
+ *   • Not yet in QUIRKS.md — visiting the route mints a Confido save-payment-
+ *     method token with no user action, once per page load, so reopening the
+ *     modal after a successful save hands the user a live-looking form bound to
+ *     a token Confido has already consumed.
  */
 
 import {
@@ -162,6 +171,8 @@ test.describe('stored payment methods', () => {
     });
     expect(status).toBe(200);
     expect(body).toMatchObject({ lastFour: CARDS.visaSuccess.lastFour });
+    const saved = body as { id: string; lastFour: string };
+    expect(saved.id).not.toHaveLength(0);
 
     await expect(dialog.getByRole('heading', { name: 'Success!' })).toBeVisible();
     // The result JSON is the `completeSavePaymentMethod` selection set: id + lastFour.
@@ -184,6 +195,26 @@ test.describe('stored payment methods', () => {
         payerEmail: 'ada@example.com',
       },
     });
+
+    // End of the line: the record the mock persisted, scoped to this firm (never
+    // to a global count — three other workers are storing methods too).
+    const state = await mock.state();
+    const mine = state.spms.filter((spm) => spm.firmId === connectedUser.firmId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0].id).toBe(saved.id);
+    expect(mine[0]).toMatchObject({
+      lastFour: CARDS.visaSuccess.lastFour,
+      paymentMethod: 'CREDIT',
+      cardBrand: CARDS.visaSuccess.brand,
+      payerName: 'Ada Lovelace',
+      payerEmail: 'ada@example.com',
+    });
+    // The one-time session it consumed is now marked used.
+    const spmSessions = state.sessions.filter(
+      (session) => session.firmId === connectedUser.firmId && session.kind === 'spm',
+    );
+    expect(spmSessions).toHaveLength(1);
+    expect(spmSessions[0].used).toBe(true);
 
     // `Close` dismisses the modal (`…Modal.tsx:147` → the page's `onClose`).
     await successCloseButton(page).click();
@@ -209,6 +240,7 @@ test.describe('stored payment methods', () => {
     });
     expect(status).toBe(200);
     expect(body).toMatchObject({ lastFour: ACH.valid.lastFour });
+    const saved = body as { id: string; lastFour: string };
 
     await expect(dialog.getByRole('heading', { name: 'Success!' })).toBeVisible();
     await expect(dialog).toContainText(`"lastFour": "${ACH.valid.lastFour}"`);
@@ -226,6 +258,21 @@ test.describe('stored payment methods', () => {
         payerName: 'Grace Hopper',
         payerEmail: 'grace@example.com',
       },
+    });
+
+    // ACH end-to-end: the shim staged an `ach` form, the browser sent
+    // `paymentMethod: 'ACH'` (asserted above), and the record the mock stored for
+    // THIS firm says ACH as well — with no card brand, unlike the card variant.
+    const state = await mock.state();
+    const mine = state.spms.filter((spm) => spm.firmId === connectedUser.firmId);
+    expect(mine).toHaveLength(1);
+    expect(mine[0].id).toBe(saved.id);
+    expect(mine[0]).toMatchObject({
+      lastFour: ACH.valid.lastFour,
+      paymentMethod: 'ACH',
+      cardBrand: null,
+      payerName: 'Grace Hopper',
+      payerEmail: 'grace@example.com',
     });
   });
 
@@ -281,6 +328,172 @@ test.describe('stored payment methods', () => {
         .filter((name) => name !== 'GetFirm'),
     ).toHaveLength(0);
   });
+
+  test('the header close button discards the form without saving anything', async ({
+    page,
+    mock,
+    connectedUser,
+  }) => {
+    const dialog = await openModal(page);
+    const mark = await mock.events.mark();
+
+    await dialog.getByLabel('Client name').fill('Never Saved');
+    await dialog.getByLabel('Email').fill('never@example.com');
+    await fillCardFields(page, CARDS.visaSuccess);
+
+    // Chakra's icon-only `ModalCloseButton` (`…Modal.tsx:50`). While the form is
+    // showing, the success `Close` button does not exist, so this is unambiguous.
+    await expect(successCloseButton(page)).toHaveCount(0);
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+    await expect(dialog).toBeHidden();
+
+    const events = await mock.events.list({ since: mark, firmId: connectedUser.firmId });
+    expect(
+      events
+        .map((event) => event.operationName)
+        .filter((name) => name !== 'GetFirm'),
+    ).toHaveLength(0);
+
+    // Nothing was stored for this firm, and the minted session is still unused.
+    const state = await mock.state();
+    expect(state.spms.filter((spm) => spm.firmId === connectedUser.firmId)).toHaveLength(
+      0,
+    );
+    const spmSessions = state.sessions.filter(
+      (session) => session.firmId === connectedUser.firmId && session.kind === 'spm',
+    );
+    expect(spmSessions).toHaveLength(1);
+    expect(spmSessions[0].used).toBe(false);
+  });
+
+  test(
+    'merely loading /stored-payment-methods mints a save-payment-method token, with no click',
+    {
+      annotation: {
+        type: 'quirk',
+        description:
+          'NOT in QUIRKS.md as of its 19 entries — same shape as #15. ' +
+          'src/pages/stored-payment-methods.tsx:16 renders ' +
+          '<CreateStoredPaymentMethodModal> unconditionally, and that component calls ' +
+          'useSavePaymentMethodToken() at CreateStoredPaymentMethodModal.tsx:43. The ' +
+          'hook fires its fetch from a useEffect with an empty dependency array ' +
+          '(useSavePaymentMethodToken.ts:21-23), so the token is minted when the PAGE ' +
+          'mounts, not when the modal opens. Simply visiting /stored-payment-methods ' +
+          'runs createSavePaymentMethodToken against Confido — a state-changing call ' +
+          'the user never asked for — and it is minted exactly once per page load, ' +
+          'which is what the next test builds on.',
+      },
+    },
+    async ({ page, mock, connectedUser }) => {
+      const mark = await mock.events.mark();
+
+      await page.goto('/stored-payment-methods');
+      await expect(
+        page.getByRole('button', { name: 'Save New Payment Method' }),
+      ).toBeVisible();
+
+      // No click has happened and none will.
+      const event = await mock.events.waitFor({
+        op: 'CreateSavePaymentMethodToken',
+        firmId: connectedUser.firmId,
+        since: mark,
+      });
+      expect(event.ok).toBe(true);
+      expect(event.tokenKind).toBe('firm');
+
+      // The dialog was never opened, so nothing on screen could have triggered it.
+      await expect(modal(page)).toHaveCount(0);
+      await expect(hostedField(page, 'cardNumber')).toHaveCount(0);
+
+      // …and a real, unused session now exists on the Confido side for this firm.
+      const state = await mock.state();
+      const spmSessions = state.sessions.filter(
+        (session) => session.firmId === connectedUser.firmId && session.kind === 'spm',
+      );
+      expect(spmSessions).toHaveLength(1);
+      expect(spmSessions[0].used).toBe(false);
+    },
+  );
+
+  test(
+    'the one-time token is not re-minted on reopen, so a second save fails on the used session',
+    {
+      annotation: {
+        type: 'quirk',
+        description:
+          'Consequence of the page-load minting above. `token` lives in ' +
+          'useSavePaymentMethodToken, which is mounted by the always-rendered ' +
+          'CreateStoredPaymentMethodModal, so it survives closing the dialog; only ' +
+          'StorePaymentMethodForm (and its `result` state, …Modal.tsx:84) unmounts. ' +
+          'Reopening therefore shows a pristine, fully usable form bound to a token ' +
+          'Confido has already consumed. The second Save round-trips all the way to ' +
+          'the API before failing, and the failure is shown as the raw serialised ' +
+          'graphql-request error at …Modal.tsx:159. Only a full page reload recovers.',
+      },
+    },
+    async ({ page, mock, connectedUser }) => {
+      const dialog = await openModal(page);
+
+      await dialog.getByLabel('Client name').fill('Ada Lovelace');
+      await dialog.getByLabel('Email').fill('ada@example.com');
+      await fillCardFields(page, CARDS.visaSuccess);
+      const first = await savePaymentMethodAndCaptureResponse(page, async () => {
+        await page.getByRole('button', { name: 'Save', exact: true }).click();
+      });
+      expect(first.status).toBe(200);
+      await expect(dialog.getByRole('heading', { name: 'Success!' })).toBeVisible();
+
+      await successCloseButton(page).click();
+      await expect(dialog).toBeHidden();
+
+      const mark = await mock.events.mark();
+      await page.getByRole('button', { name: 'Save New Payment Method' }).click();
+      await expect(dialog).toBeVisible();
+
+      // The form is back, with no trace of the success body — but no `Loading...`
+      // and no second token, because the hook's effect already ran.
+      await expect(dialog.getByRole('heading', { name: 'Success!' })).toHaveCount(0);
+      await expect(dialog.getByLabel('Client name')).toBeVisible();
+      await expect(hostedField(page, 'cardNumber')).toBeAttached();
+      await expect(dialog.getByText('Loading...')).toHaveCount(0);
+      expect(
+        await mock.events.count({
+          op: 'CreateSavePaymentMethodToken',
+          firmId: connectedUser.firmId,
+          since: mark,
+        }),
+      ).toBe(0);
+
+      await dialog.getByLabel('Client name').fill('Ada Lovelace');
+      await dialog.getByLabel('Email').fill('ada@example.com');
+      await fillCardFields(page, CARDS.visaSuccess);
+      const second = await savePaymentMethodAndCaptureResponse(page, async () => {
+        await page.getByRole('button', { name: 'Save', exact: true }).click();
+      });
+      expect(second.status).toBe(500);
+      expect(second.body).toMatchObject({
+        error: expect.stringContaining('Payment session already completed'),
+      });
+
+      // The user sees the raw graphql-request message, not a handled error.
+      await expect(dialog.getByText(/Payment session already completed/)).toBeVisible();
+      await expect(dialog.getByRole('heading', { name: 'Success!' })).toHaveCount(0);
+
+      const failed = await mock.events.waitFor({
+        op: 'CompleteSavePaymentMethod',
+        firmId: connectedUser.firmId,
+        since: mark,
+        where: (candidate) => candidate.ok === false,
+      });
+      expect(failed.errorMessage).toBe('Payment session already completed');
+
+      // And the firm still has exactly the one payment method it saved first.
+      const state = await mock.state();
+      expect(
+        state.spms.filter((spm) => spm.firmId === connectedUser.firmId),
+      ).toHaveLength(1);
+    },
+  );
 
   test(
     'an unconnected firm gets a silently empty modal: no form, no error, no explanation',

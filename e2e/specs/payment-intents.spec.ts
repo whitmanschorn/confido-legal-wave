@@ -92,6 +92,24 @@ function asPayment(body: unknown): PaymentBody {
   return body as PaymentBody;
 }
 
+/**
+ * The `paymentToken` `getServerSideProps` minted for the page that is currently
+ * loaded, read out of Next's own hydration payload
+ * (`payment-intents.tsx:25-33` puts it in `pageProps`).
+ *
+ * This is the only honest way to prove `Collect more` starts a *new* session:
+ * a `CreatePaymentToken` event alone would also fire for a token the page then
+ * ignored, or for a cached one.
+ */
+async function currentPaymentToken(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const win = window as unknown as {
+      __NEXT_DATA__?: { props?: { pageProps?: { paymentToken?: string } } };
+    };
+    return win.__NEXT_DATA__?.props?.pageProps?.paymentToken ?? '';
+  });
+}
+
 /** Amount, name and email — the three plain form fields above the tabs. */
 async function fillPayerDetails(
   page: Page,
@@ -144,6 +162,11 @@ test('renders the six hosted fields, spinners cleared, and creates a payment ses
     await expect(page.getByText(achLabels[j], { exact: true })).toBeAttached();
     await expect(page.getByText(achLabels[j], { exact: true })).not.toBeVisible();
   }
+
+  // "six hosted-field inputs present", literally: the shim appends exactly one
+  // `<input data-testid="hf-…">` per container id `useConfidoLegal.ts:66-91`
+  // passes, so anything but six means a container was dropped or duplicated.
+  await expect(page.locator('[data-testid^="hf-"]')).toHaveCount(6);
 
   // `HostedFieldInput.tsx:26` spins until `fieldState.loading === false`, so an
   // empty spinner set is the proof that the SDK reported the fields as ready.
@@ -207,7 +230,12 @@ test('a Visa card payment succeeds end to end', async ({ page, connectedUser, mo
   );
 
   await expect(successHeading(page)).toBeVisible();
+  // The rendered `<Code>` block is `JSON.stringify(result, null, 2)`
+  // (PaymentForm.tsx:183), so both of §6's literal strings must be on screen.
   await expect(page.getByText('"status": "success"')).toBeVisible();
+  await expect(
+    page.getByText(`"amountProcessed": ${dollarsToCents(AMOUNTS.tenDollars)}`),
+  ).toBeVisible();
 
   const event = await mock.events.waitFor({
     op: 'PaymentSessionComplete',
@@ -277,6 +305,9 @@ test('Collect more reloads the page and starts a fresh payment session', async (
   mock,
 }) => {
   await openPaymentIntents(page);
+  const firstToken = await currentPaymentToken(page);
+  expect(firstToken).not.toBe('');
+
   await fillPayerDetails(page, { amount: AMOUNTS.tenDollars, name: 'Ada Lovelace' });
   await fillCardFields(page, CARDS.visaSuccess);
   await runPaymentAndCaptureResponse(page, async () => {
@@ -298,6 +329,31 @@ test('Collect more reloads the page and starts a fresh payment session', async (
   await expect(successHeading(page)).toHaveCount(0);
   await expect(runPayment(page)).toBeVisible();
   await waitForHostedFields(page);
+
+  // The point of the bullet: the session really is *fresh*. An event alone
+  // would still fire if the page re-rendered with the token it already had, so
+  // compare the token Next hydrated the second render with against the first.
+  const secondToken = await currentPaymentToken(page);
+  expect(secondToken).not.toBe('');
+  expect(secondToken).not.toBe(firstToken);
+  // Exactly one new token, not a retry storm.
+  expect(
+    await mock.events.count({
+      op: 'CreatePaymentToken',
+      firmId: connectedUser.firmId,
+      since: mark,
+    }),
+  ).toBe(1);
+
+  // And the mock agrees about which is which: `store.ts:398` marks a session
+  // used once `paymentSessionComplete` lands, so the first is spent and the
+  // second has never been charged. A reused token would fail both of these.
+  const spent = await mock.sessions.get(firstToken);
+  expect(spent.used).toBe(true);
+  const fresh = await mock.sessions.get(secondToken);
+  expect(fresh.used).toBe(false);
+  expect(fresh.firmId).toBe(connectedUser.firmId);
+
   // The new session starts empty — nothing the previous payment typed survives.
   await expect(hostedField(page, 'cardNumber')).toHaveValue('');
 });
@@ -628,6 +684,13 @@ test('empty card fields fail the SDK validation and never reach the API', async 
   // without it `handleSubmit` never calls `submitFields` at all.
   await fillPayerDetails(page, { amount: AMOUNTS.tenDollars, name: 'Ada Lovelace' });
 
+  // Count the browser-side call directly, not just its downstream event: an
+  // event count alone could read as 0 simply because it was read too early.
+  let completeCalls = 0;
+  page.on('request', (request) => {
+    if (request.url().indexOf('/api/complete-payment') !== -1) completeCalls += 1;
+  });
+
   const mark = await mock.events.mark();
   await runPayment(page).click();
 
@@ -635,6 +698,12 @@ test('empty card fields fail the SDK validation and never reach the API', async 
   // for each empty card field; HostedFieldInput.tsx:50 surfaces it.
   await expect(page.getByText('Required', { exact: true })).toHaveCount(3);
   await expect(successHeading(page)).toHaveCount(0);
+  // `submitFields` rejected, so `setLoading(false)` ran and the overlay
+  // (PaymentForm.tsx:358-368) is gone — i.e. the submit is finished, not
+  // in-flight, which is what makes the two zero-counts below meaningful.
+  await expect(page.locator('.chakra-spinner')).toHaveCount(0);
+
+  expect(completeCalls).toBe(0);
 
   // No /api/complete-payment call means no PaymentSessionComplete on the wire.
   expect(
@@ -644,10 +713,20 @@ test('empty card fields fail the SDK validation and never reach the API', async 
       since: mark,
     }),
   ).toBe(0);
+  // Nothing was staged on the session either, so a later run of the same token
+  // could not be completed off the back of this click.
+  const token = await currentPaymentToken(page);
+  expect((await mock.sessions.get(token)).used).toBe(false);
 
-  // Filling the fields clears the message again.
+  // Filling the fields clears the message again, and a real submit then works.
   await fillCardFields(page, CARDS.visaSuccess);
   await expect(page.getByText('Required', { exact: true })).toHaveCount(0);
+  const { status } = await runPaymentAndCaptureResponse(page, async () => {
+    await runPayment(page).click();
+  });
+  expect(status).toBe(200);
+  expect(completeCalls).toBe(1);
+  await expect(successHeading(page)).toBeVisible();
 });
 
 test(

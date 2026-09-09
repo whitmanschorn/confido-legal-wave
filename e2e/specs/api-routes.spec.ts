@@ -180,17 +180,36 @@ test.describe('GET /api/session', () => {
   }) => {
     const connection = await connectFirm(context, mock);
 
+    // ---- before: a live token and a live glFirm -----------------------------
     const before: WaveSession = await getSession(context.request);
     expect(before.firm!.glApiToken).toBe(connection.firmToken);
-    expect(before.glFirm).toBeTruthy();
+    expect(before.glFirm).toEqual({
+      id: connection.firmId,
+      name: connection.firmName,
+      isAcceptingPayments: true,
+    });
 
     // Out-of-band revocation — what `disconnectFromPartner` does on Confido's
     // side, or an operator revoking the token in the portal.
     await mock.firms.revokeTokens(connection.firmId);
+    const revokedAt = await mock.events.mark();
 
+    // ---- the transition itself ---------------------------------------------
     const after: WaveSession = await getSession(context.request);
 
-    // src/pages/api/session.ts:44-53 catches the getFirm() failure and writes
+    // The app really did try the stored token and really was refused: the mock
+    // records the pre-execution failure the live API returns for a revoked
+    // token (PLAN.md §0.1), scoped to this test's own firm.
+    const refused = await mock.events.waitFor({
+      op: 'GetFirm',
+      firmId: connection.firmId,
+      since: revokedAt,
+    });
+    expect(refused.ok).toBe(false);
+    expect(refused.tokenKind).toBe('revoked');
+    expect(refused.errorMessage).toContain('Token has been revoked');
+
+    // src/pages/api/session.ts:44-53 catches that failure and writes
     // glApiToken: null back to the DB, so the home page falls back to the
     // connect splash instead of erroring.
     expect(after.firm!.glApiToken).toBeNull();
@@ -198,10 +217,22 @@ test.describe('GET /api/session', () => {
     expect(after.user!.id).toBe(user.userId);
     expect(after.firm!.id).toBe(user.localFirmId);
 
-    // It is persisted, not just omitted from this one response.
+    // ---- after: persisted, and the dead token is never presented again ------
+    const settledAt = await mock.events.mark();
     const again: WaveSession = await getSession(context.request);
     expect(again.firm!.glApiToken).toBeNull();
     expect(again.glFirm).toBeUndefined();
+
+    // `if (firm?.glApiToken)` is now false, so this third request must not have
+    // called Confido at all. Scoped to this firm id, so a parallel worker's
+    // traffic cannot make it pass or fail. The response above has already
+    // returned, so any call it made is in the log by now.
+    const afterSettled = await mock.events.list({
+      op: 'GetFirm',
+      firmId: connection.firmId,
+      since: settledAt,
+    });
+    expect(afterSettled).toEqual([]);
   });
 
   test('a cookie for a user that no longer exists answers 401 with the Prisma error', async ({
@@ -236,7 +267,11 @@ test.describe('POST /api/pay-request-lookup', () => {
       error: 'Firm not connected',
       details: 'Please connect your firm first',
     });
-    expect(user.localFirmId).toBeTruthy();
+    // The 400 is the "no glApiToken" branch (pay-request-lookup.ts:16-21), not
+    // the "glFirm missing" one (`:23-28`), which has a different message.
+    const session: WaveSession = await getSession(context.request);
+    expect(session.firm!.id).toBe(user.localFirmId);
+    expect(session.firm!.glApiToken).toBeNull();
   });
 
   test('a connected firm gets 200 and an empty list for an unknown externalId', async ({
@@ -252,7 +287,6 @@ test.describe('POST /api/pay-request-lookup', () => {
 
     expect(result.status).toBe(200);
     expect(JSON.parse(result.text)).toEqual({ payRequestList: [] });
-    expect(user.localFirmId).not.toBe(connection.firmId);
 
     // The lookup really reached Confido, scoped to this firm.
     const event = await mock.events.waitFor({
@@ -274,6 +308,9 @@ test.describe('POST /api/pay-request-lookup', () => {
       const result = await payRequestLookup(request, 'anything');
 
       expect(result.status).toBe(500);
+      // Next's generic page: the thrown message never reaches the caller, so
+      // an unauthenticated call is indistinguishable from a server fault.
+      expect(result.text.trim()).toBe('Internal Server Error');
       expect(result.text).not.toContain('user not found');
     },
   );
@@ -287,26 +324,62 @@ test.describe('POST /api/disconnect', () => {
   test(
     'with no firm connected it answers HTTP 200 with the body `200`',
     { annotation: { type: 'quirk', description: SEND_NUMBER_QUIRK } },
-    async ({ context, mock, user }) => {
-      // This user has never connected, so there is no Confido firm id to scope
-      // by; use the local firm id, which can never match a mock event.
-      const localGlFirmId = user.localFirmId;
-      const mark = await mock.events.mark();
+    async ({ context, user }) => {
+      const before: WaveSession = await getSession(context.request);
+      expect(before.firm!.glApiToken).toBeNull();
 
       const response = await context.request.post('/api/disconnect');
 
       expect(response.status()).toBe(200);
       expect((await response.text()).trim()).toBe('200');
 
-      // The early return means Confido is never called at all. Scoped to this
-      // test's own local firm id, because the mock store is shared with every
-      // other worker (PLAN.md §8/§9.3: never assert on global counts).
-      const disconnects = await mock.events.list({
+      // disconnect.ts:14-17 returns before touching Confido, so nothing about
+      // the session changed. (That no Confido call happened is asserted by the
+      // next test, which has a real Confido firm id to scope the event query
+      // to; this user has none, and an unscoped "no events" query would be a
+      // lie in a suite that shares one mock across workers.)
+      const after: WaveSession = await getSession(context.request);
+      expect(after.firm!.id).toBe(user.localFirmId);
+      expect(after.firm!.glApiToken).toBeNull();
+      expect(after.glFirm).toBeUndefined();
+    },
+  );
+
+  test(
+    'a second disconnect really does skip Confido rather than calling it again',
+    { annotation: { type: 'quirk', description: SEND_NUMBER_QUIRK } },
+    async ({ context, mock, user }) => {
+      // `user` is what puts the wave:userId cookie in this context's jar; the
+      // callback 500s without it.
+      const connection = await connectFirm(context, mock);
+      expect(user.localFirmId).toBeTruthy();
+
+      // First disconnect: the real one.
+      const firstMark = await mock.events.mark();
+      const first = await context.request.post('/api/disconnect');
+      expect((await first.text()).trim()).toBe('200');
+      const disconnected = await mock.events.waitFor({
         op: 'DisconnectFromPartner',
-        since: mark,
-        where: (event) => event.firmId === localGlFirmId,
+        firmId: connection.firmId,
+        since: firstMark,
       });
-      expect(disconnects).toEqual([]);
+      expect(disconnected.ok).toBe(true);
+
+      // Second disconnect: the token is gone locally, so `if (!firmToken)`
+      // short-circuits and Confido must not be called for THIS firm again.
+      // Scoped by the Confido firm id, so this is a real assertion rather than
+      // a filter that could never match.
+      const secondMark = await mock.events.mark();
+      const second = await context.request.post('/api/disconnect');
+      expect(second.status()).toBe(200);
+      expect((await second.text()).trim()).toBe('200');
+
+      const repeats = await mock.events.list({
+        op: 'DisconnectFromPartner',
+        firmId: connection.firmId,
+        since: secondMark,
+      });
+      expect(repeats).toEqual([]);
     },
   );
 
@@ -344,7 +417,9 @@ test.describe('POST /api/disconnect', () => {
       const response = await request.post('/api/disconnect');
 
       expect(response.status()).toBe(500);
-      expect(await response.text()).not.toContain('user not found');
+      const text = await response.text();
+      expect(text.trim()).toBe('Internal Server Error');
+      expect(text).not.toContain('user not found');
     },
   );
 });

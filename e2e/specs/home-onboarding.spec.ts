@@ -8,7 +8,7 @@
  * and on submit POSTs `/__control/onboarding/:token/submit` and swaps the form
  * for the text `Application submitted`.
  *
- * Note the token is fetched from a **mount effect**, not from the button click:
+ * Note the token is fetched from a **mount effect** (QUIRKS #15), not the click:
  * `OnboardingFormModal.tsx:37-39` runs `fetchToken()` on mount and the modal is
  * rendered unconditionally by both home states, so `createFirm` /
  * `createOnboardingToken` are already on the wire before `Apply Now!` or
@@ -84,6 +84,18 @@ test.describe('Apply Now! on the unconnected home page', () => {
     // Submitting the application does not make the firm live.
     expect(submitted.isAcceptingPayments).toBe(false);
 
+    // PLAN.md §6 asks for the status in `/__control/state`; scoped to our own
+    // firm id, since every worker's firms are in the same dump.
+    const state = await mock.state();
+    const inState = state.firms.filter((record) => record.id === firm.id);
+    expect(inState, 'our firm must be in /__control/state').toHaveLength(1);
+    expect(inState[0].status).toBe('APP_SUBMITTED');
+    expect(inState[0].name).toBe(user.firmName);
+    // And the onboarding token the shim submitted belongs to it.
+    const tokens = state.onboardingTokens.filter((record) => record.token === token);
+    expect(tokens, 'the onboarding token must be in the store').toHaveLength(1);
+    expect(tokens[0].firmId).toBe(firm.id);
+
     // Closing calls `router.reload()` (ConnectionOptionsSplash.tsx:29-32); the
     // firm token is stored now, so the connected — but Pending — card renders.
     await page.getByRole('button', { name: 'Close' }).click();
@@ -100,7 +112,7 @@ test.describe('Complete application on a pending firm', () => {
       annotation: {
         type: 'quirk',
         description:
-          'The onboarding token is requested from OnboardingFormModal.tsx:37-39, a mount ' +
+          'QUIRKS #15: the onboarding token is requested from OnboardingFormModal.tsx:37-39, a mount ' +
           'effect, and GravityLegalConnectStatus.tsx renders the modal unconditionally — so ' +
           '`createOnboardingToken` is issued on every home-page load, whether or not the user ' +
           'ever clicks `Complete application`.',

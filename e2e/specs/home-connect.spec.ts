@@ -8,11 +8,12 @@
  *    `src/pages/api/gravity-callback.ts:15` reads one back out.
  *  - QUIRKS #11: `src/pages/api/gravity-callback.ts:20` has no try/catch, so
  *    replaying a one-time connect code is an unhandled 500.
- *  - NEW (reported to the lead): merely rendering the unconnected home page
- *    calls `POST /api/onboarding/create-onboarding-code`, which calls
- *    `createFirm` — the disconnected state re-creates a Confido firm by itself.
- *    Asserted in home-signup-link.spec; here it only has to be waited out so
- *    the Connect callback's write is not raced by it.
+ *  - QUIRKS #15: merely rendering the unconnected home page calls
+ *    `POST /api/onboarding/create-onboarding-code`, which calls `createFirm` —
+ *    the disconnected state re-creates a Confido firm by itself. Pinned in
+ *    home-signup-link.spec; here it only has to be waited out so the Connect
+ *    callback's write is not raced by it. It is also why nothing in this file
+ *    may assert "no Confido call happened" on a home-page load.
  */
 
 import type { Page } from '@playwright/test';
@@ -51,13 +52,36 @@ function truncateFirmId(firmId: string): string {
   return `${firmId.slice(0, 6)}...${firmId.slice(-6)}`;
 }
 
+/**
+ * The `Let's collect some money` panel: exactly three cards, each with one
+ * `Try it out` link pointing at its own route. Scoped to the splash `section`
+ * so the sidebar's links to the same routes can never satisfy it.
+ */
+async function expectVehicleCards(page: Page): Promise<void> {
+  const splash = page
+    .locator('section')
+    .filter({ hasText: "Let's collect some money" })
+    .last();
+  await expect(splash.getByRole('link', { name: 'Try it out' })).toHaveCount(3);
+
+  for (let i = 0; i < VEHICLES.length; i += 1) {
+    const vehicle = VEHICLES[i];
+    const link = splash.locator(`a[href="${vehicle.href}"]`);
+    await expect(link, `${vehicle.name} → ${vehicle.href}`).toHaveCount(1);
+    await expect(link).toHaveText('Try it out');
+    // The link's parent is the card `Stack`, which carries the vehicle name.
+    await expect(link.locator('xpath=..')).toContainText(vehicle.name);
+  }
+}
+
 test.describe('unconnected home', () => {
   test('offers the three connection options and links straight to the Connect page', async ({
     page,
     user,
   }) => {
-    expect(user.username).toBeTruthy();
     await gotoUnconnectedHome(page);
+    // The sidebar identifies the logged-in user this splash belongs to.
+    await expect(page.getByText(user.username, { exact: true })).toBeVisible();
 
     // The three accordion headers. Each one's accessible name is the heading
     // text plus its `Badge`, so the badge is asserted for free.
@@ -93,8 +117,8 @@ test.describe('unconnected home', () => {
       },
     },
     async ({ page, user }) => {
-      expect(user.username).toBeTruthy();
       await gotoUnconnectedHome(page);
+      await expect(page.getByText(user.username, { exact: true })).toBeVisible();
 
       const href = await page
         .getByRole('link', { name: new RegExp('connect/mock-app') })
@@ -115,8 +139,8 @@ test.describe('connecting', () => {
     mock,
     user,
   }) => {
-    expect(user.username).toBeTruthy();
     await gotoUnconnectedHome(page);
+    await expect(page.getByText(user.username, { exact: true })).toBeVisible();
 
     const mark = await mock.events.mark();
 
@@ -149,8 +173,10 @@ test.describe('connecting', () => {
     const firmId = session.glFirm?.id;
     expect(firmId, 'the callback must have stored a Confido firm token').toBeTruthy();
     expect(session.firm?.glApiToken).toMatch(/^f_secret_mock_/);
+    expect(session.glFirm?.isAcceptingPayments).toBe(true);
 
     const firm = await mock.firms.get(firmId!);
+    expect(session.glFirm?.name).toBe(firm.name);
     expect(firm.status).toBe('ACTIVE');
     expect(firm.isAcceptingPayments).toBe(true);
     expect(firm.name).toMatch(/^Connected Firm /);
@@ -174,6 +200,17 @@ test.describe('connecting', () => {
       page.getByRole('heading', { name: "Let's collect some money 💸🤑" }),
     ).toBeVisible();
     await expect(page.getByRole('button', { name: 'Disconnect' })).toBeVisible();
+
+    // …and the three vehicle cards the connected home page unlocks.
+    await expectVehicleCards(page);
+
+    // The splash the user started on is gone.
+    await expect(
+      page.getByRole('heading', { name: "Let's get started 🚀" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole('link', { name: new RegExp('connect/mock-app') }),
+    ).toHaveCount(0);
   });
 
   test('the truncated firm id is the first six and last six characters', async ({
@@ -197,25 +234,12 @@ test.describe('connecting', () => {
     page,
     connectedUser,
   }) => {
-    expect(connectedUser.firmId).toBeTruthy();
     await page.goto('/');
+    await expect(page.getByText('Connected to Confido Legal ✅')).toBeVisible();
+    // The sidebar identifies the firm this page belongs to.
+    await expect(page.getByText(connectedUser.username, { exact: true })).toBeVisible();
 
-    // Scope to the PaymentVehiclesSplash section so the sidebar's own links to
-    // the same routes cannot match.
-    const splash = page
-      .locator('section')
-      .filter({ hasText: "Let's collect some money" })
-      .last();
-    await expect(splash.getByRole('link', { name: 'Try it out' })).toHaveCount(3);
-
-    for (let i = 0; i < VEHICLES.length; i += 1) {
-      const vehicle = VEHICLES[i];
-      const link = splash.locator(`a[href="${vehicle.href}"]`);
-      await expect(link, `${vehicle.name} → ${vehicle.href}`).toHaveCount(1);
-      await expect(link).toHaveText('Try it out');
-      // The link's parent is the card `Stack`, which carries the vehicle name.
-      await expect(link.locator('xpath=..')).toContainText(vehicle.name);
-    }
+    await expectVehicleCards(page);
   });
 });
 
@@ -276,6 +300,10 @@ test.describe('replaying a connect code', () => {
       },
     },
     async ({ page, context, mock, connectedUser }) => {
+      // Scoped to this test's own code: three other workers are replaying and
+      // exchanging codes against the same mock store at the same time.
+      const mark = await mock.events.mark();
+
       // The fixture already exchanged this code once.
       const response = await connectViaCallback(page, connectedUser.connectCode);
 
@@ -287,13 +315,17 @@ test.describe('replaying a connect code', () => {
       // The mock rejected the second exchange, and the stored token is untouched.
       const failed = await mock.events.waitFor({
         op: 'ExchangedCodeForFirmToken',
-        where: (event) => !event.ok,
+        since: mark,
+        where: (event) =>
+          (event.variables as { code?: string }).code === connectedUser.connectCode,
       });
       expect(failed.ok).toBe(false);
-      expect(failed.errorMessage).toBeTruthy();
+      expect(failed.errorMessage).toBe('Invalid or expired code');
 
       const session = await getSession(context.request);
       expect(session.firm?.glApiToken).toBe(connectedUser.firmToken);
+      // The replay took nothing away either: the firm is still connected.
+      expect(session.glFirm?.id).toBe(connectedUser.firmId);
     },
   );
 });

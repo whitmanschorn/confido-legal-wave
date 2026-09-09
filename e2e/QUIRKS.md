@@ -22,7 +22,7 @@ credential, or take an action the user did not ask for.
 | 3 | Medium | [Routes that skip `requireAuth` render for logged-out visitors, then crash on the client](#3-routes-that-skip-requireauth-render-for-logged-out-visitors-then-crash-on-the-client) |
 | 4 | Low | [`getSessionFromRequestOrThrow` surfaces as a bare 500](#4-getsessionfromrequestorthrow-surfaces-as-a-bare-500) |
 | 5 | Low | [`createSavePaymentMethodToken` passes an options object where variables belong](#5-createsavepaymentmethodtoken-passes-an-options-object-where-variables-belong) |
-| 6 | Low | [The Paylinks form dereferences `paymentLink` without a guard](#6-the-paylinks-form-dereferences-paymentlink-without-a-guard) |
+| 6 | Medium | [The Paylinks form dereferences `paymentLink` without a guard](#6-the-paylinks-form-dereferences-paymentlink-without-a-guard) |
 | 7 | Medium | [The Paylinks page 500s for everyone: the payment link id is hardcoded](#7-the-paylinks-page-500s-for-everyone-the-payment-link-id-is-hardcoded) |
 | 8 | Low | [The SDK type declarations reference types that do not exist](#8-the-sdk-type-declarations-reference-types-that-do-not-exist) |
 | 9 | Low | [Non-null assertions on surcharging fields the interface says may be null](#9-non-null-assertions-on-surcharging-fields-the-interface-says-may-be-null) |
@@ -36,6 +36,13 @@ credential, or take an action the user did not ask for.
 | 17 | Medium | [`/payment-intents` 500s for a logged-in but unconnected user](#17-payment-intents-500s-for-a-logged-in-but-unconnected-user) |
 | 18 | Medium | [The Paylinks form has no success state, so a successful payment makes it vanish](#18-the-paylinks-form-has-no-success-state-so-a-successful-payment-makes-it-vanish) |
 | 19 | Medium | [Webhook signatures are verified against a re-serialised body, not the raw bytes](#19-webhook-signatures-are-verified-against-a-re-serialised-body-not-the-raw-bytes) |
+| 20 | Medium | [The Paylinks surcharging notice is a lie: the fee is announced but never charged](#20-the-paylinks-surcharging-notice-is-a-lie-the-fee-is-announced-but-never-charged) |
+| 21 | **High** | [The app server-renders nothing: every page ships an empty shell](#21-the-app-server-renders-nothing-every-page-ships-an-empty-shell) |
+| 22 | Medium | [`/stored-payment-methods` calls Confido on every page load, with no modal open](#22-stored-payment-methods-calls-confido-on-every-page-load-with-no-modal-open) |
+| 23 | Medium | [After a successful save, reopening the modal offers a form bound to a spent token](#23-after-a-successful-save-reopening-the-modal-offers-a-form-bound-to-a-spent-token) |
+| 24 | Medium | [Raw serialised GraphQL errors are rendered straight to the user](#24-raw-serialised-graphql-errors-are-rendered-straight-to-the-user) |
+| 25 | **High** | [The standing-link page frames any URL a query parameter names](#25-the-standing-link-page-frames-any-url-a-query-parameter-names) |
+| 26 | Medium | [Both webhook handlers log the full payload in plaintext on every request](#26-both-webhook-handlers-log-the-full-payload-in-plaintext-on-every-request) |
 
 ---
 
@@ -110,10 +117,23 @@ $ curl -s -o /dev/null -w '[%{http_code}]\n' localhost:7001/clients
 [200]
 ```
 
-The server-rendered HTML is fine, but `src/components/layout/Sidebar.tsx:67` and `:69` then dereferences
-`session.firm!.name` and `session.user!.username`. For a logged-out visitor `/api/session` returns
-`{}`, so both are `undefined` and the render throws. *(In-browser behaviour verified in Phase 2; see
-the `auth.spec` annotation for exactly what the user sees.)*
+`src/components/layout/Sidebar.tsx:67` and `:69` then dereference `session.firm!.name` and
+`session.user!.username`. For a logged-out visitor `/api/session` returns `{}`, so both are
+`undefined` and the render throws.
+
+**What the visitor actually sees** (observed in the browser; identical on all three routes):
+
+* `document.title` → `Application error: a client-side exception has occurred`
+* the entire visible body text, and nothing else on the page:
+  `Application error: a client-side exception has occurred (see the browser console for more information).`
+* console error, twice: `TypeError: Cannot read properties of undefined (reading 'name')` at `Sidebar`
+* no uncaught page error — React's boundary catches it, so `pageErrors` is empty
+
+A bare white page with one sentence. No sidebar, no content, and no hint that the real cause is simply
+being logged out — a login prompt is what should have happened. Because the app server-renders nothing
+(quirk #21), there is no useful HTML underneath either.
+
+*(An earlier draft of this entry said "the server-rendered HTML is fine." That was wrong — see #21.)*
 
 ## 4. `getSessionFromRequestOrThrow` surfaces as a bare 500
 
@@ -167,9 +187,22 @@ amount: hostedFieldsState?.paymentLink.totalAmount,
 
 The optional chain stops at `hostedFieldsState`, so `paymentLink` is dereferenced unguarded. The SDK
 type permits state with no `paymentLink` (`src/confido-legal-hook/ConfidoLegal.d.ts:110`,
-`paymentLink?: any`) — which is what any non-paylink session or a load error produces. `Run payment`
-then throws a `TypeError`, which the `catch` swallows into `setError(e)`, and the page renders the raw
-error object in an alert rather than a message.
+`paymentLink?: any`) — which is what any non-paylink session or a load error produces.
+
+**The failure is worse than "an unhelpful error message."** `Run payment` throws a `TypeError`, the
+`catch` swallows it into `setError(e)`, and `PaylinkPaymentForm.tsx:112-117` then renders
+`<span>{error}</span>` — an `Error` **object** as a React child. React refuses to render that, so the
+render throws in turn and the entire tree unmounts into Next's
+`Application error: a client-side exception has occurred`. The user loses the whole page.
+
+Two details worth keeping: the `TypeError` fires while building the `fetch` body, so **no
+`/api/complete-payment` request is ever sent** — nobody is charged, they just lose the page. And the
+same `<span>{error}</span>` shape exists in `PaymentForm.tsx:154`, so any error routed through
+`setError` there is a latent white-screen too.
+
+Asserted deterministically in `paylinks.spec.ts` by rewriting only the shim's
+`GET /__control/sessions/:token` response to `paymentLink: null` — a legitimate `SessionView` per
+`mock-server/types.ts` — so staging still succeeds and the failure is unambiguously line 76.
 
 This compounds with the Paylinks page being broken for every account but the author's (quirk 7).
 
@@ -390,6 +423,160 @@ Consequences, all asserted in `webhooks.spec.ts`:
 That combination is backwards from what a signature is for: it tolerates a difference that should
 invalidate the payload, while breaking on a difference that a JSON-object sender may legitimately
 introduce. Both endpoints share the flaw (`legacy-accept-webhook.ts:14`).
+
+## 20. The Paylinks surcharging notice is a lie: the fee is announced but never charged
+
+`src/components/paylinks/PaylinkPaymentForm.tsx:135-140` renders
+
+> a 3% surcharging fee will be added
+
+whenever `state.surcharging.willBeApplied`. But the Paylinks form **never calls
+`recalculateSurcharging`**:
+
+```console
+$ grep -n "recalculateSurcharging" src/components/paylinks/PaylinkPaymentForm.tsx
+(no output)
+$ grep -n "recalculateSurcharging" src/components/payment-intents/PaymentForm.tsx
+147:      hf.recalculateSurcharging({
+```
+
+Payment Intents drives the SDK's surcharge calculation on every amount change; Paylinks never does.
+And `:76` posts `amount: hostedFieldsState?.paymentLink.totalAmount` — the link total, unmodified.
+
+So the payer is told a fee will be added, no fee is ever displayed, and the amount charged is exactly
+the link total (25000, not 25750). The notice is decorative. Whether the *right* fix is to charge the
+fee or to drop the notice is a product question, but the two states cannot both be right.
+
+Pinned in `paylinks.spec.ts` → `the surcharging notice appears on the card tab but no fee is ever charged`.
+
+## 21. The app server-renders nothing: every page ships an empty shell
+
+`src/components/layout/SessionProvider.tsx:52` renders `{loaded && props.children}`, and `loaded`
+only flips after a **client-side** `GET /api/session` resolves. Since `SessionProvider` wraps the
+whole app in `_app.tsx`, no page renders any markup on the server:
+
+```console
+$ curl -s localhost:7001/login | grep -c "Login to your"
+0
+```
+
+The `#__next` div is ~22 KB of Chakra emotion `<style>` blocks and a hidden `<span id="__chakra_env">`
+— zero app markup — on **every** route, `/login` included. `__NEXT_DATA__` reports
+`"nextExport":true,"autoExport":true`.
+
+**Why it matters.** The app goes to real trouble to server-render: `getServerSideProps`, `requireAuth`
+redirects, `getMyPartner()` on the home page. All of that work is discarded — the user sees nothing
+until a second round trip to `/api/session` completes, so every page has a blocking waterfall and a
+guaranteed blank first paint. It also means any client-side render error degrades to a completely
+white page (quirk #3) instead of falling back to server HTML.
+
+The fix is to gate only the parts that need session data, rather than the entire tree.
+
+## 22. `/stored-payment-methods` calls Confido on every page load, with no modal open
+
+The same shape as quirk #15, on a second screen. `src/pages/stored-payment-methods.tsx:16` renders
+`<CreateStoredPaymentMethodModal>` unconditionally — `isOpen` only controls whether Chakra *paints*
+the modal, not whether it mounts — and
+`src/components/stored-payment-methods/useSavePaymentMethodToken.ts:21-23` calls `fetchAndSaveToken()`
+from a mount effect with no `isOpen` guard.
+
+So merely visiting the page issues `GET /api/stored-payment-methods/create-token`, which for a
+connected firm is a real `createSavePaymentMethodToken` call to Confido. Nobody clicked anything.
+
+For a logged-out visitor the same route answers:
+
+```console
+$ curl -s localhost:7001/api/stored-payment-methods/create-token
+{"error":"user not found"}   [status=500]
+```
+
+Note this one **does** leak the thrown message, unlike quirk #4 where the identical
+`getSessionFromRequestOrThrow` throw is swallowed into a bare `Internal Server Error` — because
+`create-token.ts:19-20` echoes `e.message`. The two routes handle the same failure inconsistently.
+
+Pinned by `auth.spec.ts` → `logged out /stored-payment-methods calls create-token before it crashes`.
+
+## 23. After a successful save, reopening the modal offers a form bound to a spent token
+
+A direct consequence of #22. `useSavePaymentMethodToken()` is called in
+`CreateStoredPaymentMethodModal` (`:43`) — the component that is **always mounted** — so `token`
+survives closing the dialog. Only the inner `StorePaymentMethodForm` and its `result` state unmount.
+
+So after saving a card and clicking `Close`, reopening shows a **pristine, live-looking form**: no
+`Loading...`, no second `CreateSavePaymentMethodToken`, and every field ready for input. But the token
+behind it has already been consumed. The second `Save` travels all the way to the API and fails:
+
+* `POST /api/stored-payment-methods/complete` → 500
+* mock event `CompleteSavePaymentMethod`, `ok: false`, `errorMessage: 'Payment session already completed'`
+* the user sees the raw serialised `graphql-request` error (see #24)
+
+Only a full page reload recovers. Pinned by
+`stored-payment-methods.spec.ts` → `the one-time token is not re-minted on reopen, so a second save fails on the used session`.
+
+## 24. Raw serialised GraphQL errors are rendered straight to the user
+
+`graphql-request` builds its `ClientError.message` as the first error followed by the whole exchange
+(`node_modules/graphql-request/build/cjs/types.js:6-9`):
+
+```js
+const message = `${ClientError.extractMessage(response)}: ${JSON.stringify({ response, request })}`;
+```
+
+Two screens put that string directly into the UI:
+
+* `src/pages/clients.tsx:54-57` — `setError(err.message)` into a Chakra `Alert`. After a failed client
+  lookup the alert visibly contains `query GetClient($id: String!)` and `"variables"`.
+* `src/components/stored-payment-methods/CreateStoredPaymentMethodModal.tsx:159` — `{error.message}`
+  rendered in the modal body, which is how #23 surfaces.
+
+A third instance is server-side: `src/pages/api/stored-payment-methods/create-token.ts:19-20` echoes
+`e.message` into the 500 body, so the GraphQL document reaches the browser that way too (#22).
+
+**This is a presentation failure, not a credential leak** — and the tests assert both halves. A
+`ClientError`'s `request` is only `{ query, variables }`; it carries no headers, so the firm's
+`x-api-key` is *not* in the string. The suite asserts the query text is present **and** that the token
+is absent, so if a future change starts including headers, the test fails.
+
+Both are asserted in `clients.spec.ts` → `requesting an id the firm does not own shows the API USER_INPUT_ERROR`.
+
+## 25. The standing-link page frames any URL a query parameter names
+
+`src/pages/iframes/standinglink.tsx:7` takes `?url=` straight off the query string and puts it into
+`<iframe src>` at `:20` with **no scheme check and no host allow-list** — any origin on the internet
+can be framed inside the Legal Wave page by crafting a link.
+
+The `sandbox` attribute (`:27`) is commented `// Security attributes for iframe`, but it grants:
+
+```
+sandbox='allow-same-origin allow-scripts allow-forms allow-popups allow-top-navigation'
+```
+
+* **`allow-top-navigation`** lets the framed page navigate the *top* window. Combined with
+  attacker-chosen `?url=`, that is an open-redirect and phishing primitive wearing a legalwave.com URL.
+* **`allow-same-origin` together with `allow-scripts`** is the documented combination that defeats the
+  sandbox: it lets the frame remove its own sandbox attribute. Since the frame is same-origin with
+  Legal Wave, it is not isolated from the app either.
+
+The suite pins the attribute string so a change is visible, but **does not attempt an exploit** — that
+is for the maintainers to assess. Related to #10: this app has no CSRF or origin discipline anywhere.
+
+## 26. Both webhook handlers log the full payload in plaintext on every request
+
+`src/pages/api/accept-webhook.ts:23-24` (and the identical `legacy-accept-webhook.ts:23-24`):
+
+```js
+console.log('Incoming Webhook: Signature ✅');
+console.log(JSON.stringify(req.body, null, 2));
+```
+
+Every successfully signed webhook body is written to the server log verbatim, and both handlers also
+log on the rejection path (`:18`). Payment webhooks carry payer names, emails and transaction detail,
+so this puts customer data into whatever aggregates stdout.
+
+PLAN.md §6 asked `webhooks.spec` to assert the valid-signature case is "console-free". **It cannot
+be** — the logging is unconditional, and a Playwright spec cannot reach the Next server's stdout
+anyway. That clause of the bullet is unsatisfiable against the app as written; the rest of the bullet
+is covered.
 
 ---
 

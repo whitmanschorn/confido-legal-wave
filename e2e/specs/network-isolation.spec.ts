@@ -234,6 +234,10 @@ test.describe('strict network isolation', () => {
         lockdown.escaped.splice(i, 1);
       }
     }
+    // The splice removed only entries the allow-list matched exactly (see the
+    // `the escape allow-list is exact` test below for the predicate's own
+    // proof), and it removed all of them.
+    expect(lockdown.escaped.filter(isKnownThirdPartyAvatar)).toEqual([]);
     expect(lockdown.offendingEscapes()).toEqual([]);
   });
 });
@@ -288,5 +292,84 @@ test.describe('the lockdown guard itself', () => {
     // guard has nothing left to report.
     lockdown.clear();
     expect(lockdown.offendingEscapes()).toEqual([]);
+  });
+
+  test('the escape allow-list is exact, so the teardown-guard splice cannot hide a real escape', () => {
+    // The journey test removes already-asserted avatars from `lockdown.escaped`
+    // before teardown. That is only safe if the predicate deciding what to
+    // remove matches whole URLs and nothing else — so exercise it directly.
+    const avatar: EscapedRequest = {
+      url: SIDEBAR_AVATAR_URL,
+      method: 'GET',
+      resourceType: 'image',
+    };
+    expect(isKnownThirdPartyAvatar(avatar)).toBe(true);
+
+    // Near misses, each of which a substring or prefix match would wave through.
+    expect(
+      isKnownThirdPartyAvatar({ ...avatar, url: `${SIDEBAR_AVATAR_URL}?token=leaked` }),
+    ).toBe(false);
+    expect(
+      isKnownThirdPartyAvatar({ ...avatar, url: `https://evil.example/${SIDEBAR_AVATAR_URL}` }),
+    ).toBe(false);
+    expect(isKnownThirdPartyAvatar({ ...avatar, url: 'https://tinyurl.com/' })).toBe(false);
+    // Same URL, but exfiltrating rather than fetching an image.
+    expect(isKnownThirdPartyAvatar({ ...avatar, method: 'POST' })).toBe(false);
+    expect(isKnownThirdPartyAvatar({ ...avatar, resourceType: 'fetch' })).toBe(false);
+    // And the one origin that must never be waved through under any type.
+    expect(
+      isKnownThirdPartyAvatar({ ...avatar, url: `${SANDBOX_GRAPHQL_URL}/whatever` }),
+    ).toBe(false);
+  });
+
+  test('the one permitted non-loopback origin is answered by the mock, not by Confido', async ({
+    page,
+    mock,
+    lockdown,
+  }) => {
+    // The mirror image of the abort probe above: the *forwarded* branch needs a
+    // positive control too, or "no escapes" could just mean "the request went
+    // to the real sandbox and nobody noticed".
+    await page.goto('/login');
+    expect(lockdown.forwardCount()).toBe(0);
+
+    const mark = await mock.events.mark();
+    const probe = await page.evaluate(async (url: string) => {
+      // Same shape as src/components/clients/AddClient.tsx:58 — a browser fetch
+      // to the sandbox URL inlined in the client bundle, with an x-api-key
+      // header, so it is CORS-preflighted exactly like the real one.
+      const response = await window.fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': 'p_secret_mock_partner',
+        },
+        body: JSON.stringify({
+          // Deliberately not one of the app's 14 operation names, so the event
+          // this produces can only be this test's and never a parallel
+          // worker's home page.
+          operationName: 'LockdownForwardProbe',
+          query: 'query LockdownForwardProbe { me { partner { id appId } } }',
+        }),
+      });
+      return { status: response.status, text: await response.text() };
+    }, SANDBOX_GRAPHQL_URL);
+
+    // Only the mock knows this partner: the real sandbox would reject the token.
+    expect(probe.status).toBe(200);
+    const payload = JSON.parse(probe.text) as {
+      data?: { me?: { partner?: { id?: string; appId?: string } } };
+    };
+    expect(payload.data!.me!.partner!.appId).toBe('mock-app');
+
+    const event = await mock.events.waitFor({ op: 'LockdownForwardProbe', since: mark });
+    expect(event.tokenKind).toBe('partner');
+    expect(event.ok).toBe(true);
+
+    // Recorded as a forward, not as an escape, and it really was rewritten.
+    expect(lockdown.forwarded).toEqual([
+      { url: SANDBOX_GRAPHQL_URL, method: 'POST', status: 200 },
+    ]);
+    expect(lockdown.escaped).toEqual([]);
   });
 });

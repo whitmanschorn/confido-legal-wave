@@ -2,7 +2,7 @@
  * home-signup-link.spec — the "Sign Up Link" connection option on the home page.
  *
  * PLAN.md §6 "home-signup-link.spec". The plan expected the *first* click of
- * `Sign Up For Confido Legal` to record `createFirm`. It does not: the firm is
+ * `Sign Up For Confido Legal` to record `createFirm`. It does not (QUIRKS #15): the firm is
  * already created before the button is even clickable, because
  * `src/components/home/ConnectionOptionsSplash.tsx:152` renders
  * `<OnboardingFormModal>` unconditionally and
@@ -58,7 +58,7 @@ test.describe('createFirm', () => {
       annotation: {
         type: 'quirk',
         description:
-          'ConnectionOptionsSplash.tsx:152 always renders <OnboardingFormModal>, whose mount ' +
+          'QUIRKS #15: ConnectionOptionsSplash.tsx:152 always renders <OnboardingFormModal>, whose mount ' +
           'effect (OnboardingFormModal.tsx:37-39) POSTs /api/onboarding/create-onboarding-code. ' +
           'With no firm token stored, create-onboarding-code.ts:23 calls createFirm and :31 ' +
           'writes the returned apiToken to the local firm. So simply viewing the "not yet ' +
@@ -202,10 +202,21 @@ test.describe('Sign Up For Confido Legal', () => {
 
 test.describe('a firm that is not accepting payments yet', () => {
   test('the sign-up link the API returns is the frozen query form', async ({
+    mock,
     pendingFirmUser,
   }) => {
     expect(pendingFirmUser.signUpLink.indexOf(`${SIGNUP_PREFIX}?s_code=`)).toBe(0);
     expect(pendingFirmUser.signUpCode).toMatch(/^[0-9a-f]{32}$/);
+
+    // …and it is the link the mock minted for THIS firm, not just a well-formed
+    // string. Filtered by code, so other workers' links cannot satisfy it.
+    const state = await mock.state();
+    const minted = state.signUpLinks.filter(
+      (record) => record.code === pendingFirmUser.signUpCode,
+    );
+    expect(minted, 'the s_code must exist in the mock store').toHaveLength(1);
+    expect(minted[0].firmId).toBe(pendingFirmUser.firmId);
+    expect(minted[0].link).toBe(pendingFirmUser.signUpLink);
   });
 
   test('home shows Pending, the sandbox hint and no payment vehicles', async ({

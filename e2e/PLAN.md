@@ -121,7 +121,7 @@ Selectors the app exposes (there are **no** `data-testid`s in the app; use roles
 | Stored Payment Methods | button `Save New Payment Method`; modal heading `Save a Payment Method`, text `Loading...` while the token is fetched, labels `Client name`, `Email`; tabs; buttons `Save` / `Cancel`; result heading `Success!` then `Close` |
 | Clients | button `Add client`; modal heading `Add a Client`, label `Client Name`, submit button `Add Client`; result heading `Added client`; button `Request client by id`; heading `Requested client` |
 | Transactions | static template: text `Showing 1 to 5 of 42 results`, 5 rows |
-| Card brand icon | `CreditCardBrandIcon` inlines an SVG via `@svgr/webpack` with **no** title, `alt` or `aria-label`. Distinguish by brand fill: visa `path[fill="#0E4595"]` (3 paths), mastercard `path[fill="#D9222A"]` (7 paths), generic `path[fill="#9D9400"]`. |
+| Card brand icon | `CreditCardBrandIcon` inlines an SVG via `@svgr/webpack` with **no** title, `alt` or `aria-label`. Distinguish by brand fill: visa `path[fill="#0E4595"]` (**one** such path, not three as first written here), mastercard `path[fill="#D9222A"]`, generic `path[fill="#9D9400"]`. Assert the generic icon *before* typing and its absence after, so the test proves the icon changed. |
 | Owner form | `Invalid url` alert when no `o_code` |
 | Standing link iframe | `No standing link URL provided` |
 

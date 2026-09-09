@@ -11,27 +11,35 @@
  * `CONFIDO_LIVE_INTROSPECT=1`, mirroring
  * `e2e/mock-server/scripts/refresh-schema.ts`, and CI never sets it.
  *
- * That gate is **not** a suppressed failure (PLAN.md §8.3): the two offline
+ * That gate is **not** a suppressed failure (PLAN.md §8.3): the six offline
  * tests below always run, they are the ones that would catch the mock drifting
- * from what the app actually sends, and the third test states its opt-in
- * condition in its own title so a skip in the report is self-explanatory.
+ * from what the app actually sends, an `afterAll` proves the gated body did not
+ * run, and the gated test states its opt-in condition in its own title so a
+ * skip in the report is self-explanatory.
  *
  * ## What "fail only on breaking changes that touch our 14 operations" means
  *
  * The real SDL is ~4000 lines and the app uses a sliver of it. Comparing the
  * whole schema would fail on any unrelated Confido release. So the 14 operation
- * documents the app actually sends are reproduced here verbatim, the exact set
- * of type/field coordinates they touch is derived from them with `TypeInfo`
- * (never hand-maintained), and only `findBreakingChanges` entries naming one of
- * those coordinates are fatal. Everything else — the rest of the breaking
- * changes and every dangerous change — is attached to the report and logged.
+ * documents are **read out of `src/confido-legal-requests/` at run time** — not
+ * copied into this file, where they could quietly drift from what the app
+ * sends — the exact set of type/field coordinates they touch is derived from
+ * them with `TypeInfo` (never hand-maintained), and only `findBreakingChanges`
+ * entries naming one of those coordinates are fatal. Everything else — the rest
+ * of the breaking changes and every dangerous change — is attached to the
+ * report and logged.
+ *
+ * `validate()` only sees what a document *mentions*, so it cannot see the input
+ * fields the app passes as JSON variables (`mockOnboarding`, `externalId`, …).
+ * Those are listed separately, with the `src/` line that sends each one, and
+ * checked against both schemas.
  *
  * As a second, sharper check the same 14 documents are `validate()`d against the
  * live schema: a document that no longer validates is drift by definition,
  * whatever `findBreakingChanges` decided to call it.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   DocumentNode,
@@ -46,6 +54,7 @@ import {
   buildSchema,
   findBreakingChanges,
   findDangerousChanges,
+  isInputObjectType,
   parse,
   printSchema,
   validate,
@@ -76,212 +85,146 @@ const INTROSPECT_ENDPOINT =
   process.env.CONFIDO_INTROSPECT_ENDPOINT ?? DEFAULT_INTROSPECT_ENDPOINT;
 
 // ---------------------------------------------------------------------------
-// The 14 operations the app sends, copied verbatim from src/
+// The 14 operations the app sends, read out of the app's own source
 // ---------------------------------------------------------------------------
+
+/**
+ * Every `gql` document under `src/confido-legal-requests/` is one operation the
+ * app sends: the ten `index.ts` re-exports, plus `createOnboardingToken.ts` and
+ * the two the Clients page calls straight from the browser (`addClient.ts`,
+ * `getClient.ts`). Reading them from disk is the whole point — a copy in this
+ * file would keep passing after someone edited a selection set in `src/`.
+ */
+const APP_REQUESTS_DIR = join(__dirname, '..', '..', 'src', 'confido-legal-requests');
+
+/**
+ * The wire `operationName`s the mock's event log records (PLAN.md §6). This is
+ * the only hardcoded list left and it is an *assertion target*, never the
+ * source of the documents: if the app gains, loses or renames an operation the
+ * discovery test fails and names it.
+ */
+const EXPECTED_OPERATION_NAMES: string[] = [
+  'AddClient',
+  'CompleteSavePaymentMethod',
+  'CreateFirm',
+  'CreateFirmSignUpLink',
+  'CreateOnboardingToken',
+  'CreatePaymentToken',
+  'CreateSavePaymentMethodToken',
+  'DisconnectFromPartner',
+  // The app's own typo: the operation is named `ExchangedCodeForFirmToken`
+  // while the field it selects is `exchangeCodeForFirmApiToken`.
+  'ExchangedCodeForFirmToken',
+  'GetClient',
+  'GetFirm',
+  'GetMyPartner',
+  'PayRequestList',
+  'PaymentSessionComplete',
+];
 
 interface AppOperation {
   /** `operationName` on the wire, i.e. what `mock.events` records. */
-  name: string;
-  /** Where the document lives in the app. */
+  name: string | null;
+  /** `src/confido-legal-requests/getFirm.ts:4` — where the document lives. */
   source: string;
+  /** The text inside the gql`` template, verbatim. */
   document: string;
+  /** Parsed form, or `null` when the document is not valid GraphQL at all. */
+  ast: DocumentNode | null;
+  parseError: string | null;
 }
 
-const APP_OPERATIONS: AppOperation[] = [
-  {
-    name: 'GetMyPartner',
-    source: 'src/confido-legal-requests/getMyPartner.ts',
-    document: `
-      query GetMyPartner {
-        me {
-          partner {
-            id
-            appId
-          }
-        }
+/**
+ * `gql`…`` with no interpolation. Every document in the app is a plain
+ * template literal, so a backtick-delimited grab is exact; if one ever gained a
+ * `${}` the document would fail to parse and the discovery test would say so.
+ */
+const GQL_TEMPLATE = /\bgql`([^`]*)`/g;
+
+function operationNameOf(ast: DocumentNode): string | null {
+  const definitions = ast.definitions;
+  for (let i = 0; i < definitions.length; i += 1) {
+    const definition = definitions[i];
+    if (definition.kind === Kind.OPERATION_DEFINITION) {
+      return definition.name ? definition.name.value : null;
+    }
+  }
+  return null;
+}
+
+function toOperation(source: string, document: string): AppOperation {
+  try {
+    const ast = parse(document);
+    return { name: operationNameOf(ast), source, document, ast, parseError: null };
+  } catch (error) {
+    return { name: null, source, document, ast: null, parseError: String(error) };
+  }
+}
+
+/** Every gql`` document in `dir`, in filename order, tagged with `file:line`. */
+function readGqlDocuments(dir: string, relative: string): AppOperation[] {
+  const found: AppOperation[] = [];
+  readdirSync(dir)
+    .filter((file) => /\.tsx?$/.test(file))
+    .sort()
+    .forEach((file) => {
+      const text = readFileSync(join(dir, file), 'utf8');
+      GQL_TEMPLATE.lastIndex = 0;
+      let match = GQL_TEMPLATE.exec(text);
+      while (match !== null) {
+        const line = text.slice(0, match.index).split('\n').length;
+        found.push(toOperation(`${relative}/${file}:${line}`, match[1]));
+        match = GQL_TEMPLATE.exec(text);
       }
-    `,
-  },
-  {
-    name: 'GetFirm',
-    source: 'src/confido-legal-requests/getFirm.ts',
-    document: `
-      query GetFirm {
-        firm {
-          id
-          isAcceptingPayments
-          name
-        }
-      }
-    `,
-  },
-  {
-    name: 'GetClient',
-    source: 'src/confido-legal-requests/getClient.ts',
-    document: `
-      query GetClient($id: String!) {
-        client(id: $id) {
-          id
-          clientName
-          email
-          phone
-        }
-      }
-    `,
-  },
-  {
-    name: 'PayRequestList',
-    source: 'src/confido-legal-requests/payRequestList.ts',
-    document: `
-      query PayRequestList($input: PayRequestInput!) {
-        payRequestList(input: $input) {
-          externalId
-          transactions {
-            id
-            status_v2
-          }
-        }
-      }
-    `,
-  },
-  {
-    name: 'CreateFirm',
-    source: 'src/confido-legal-requests/createFirm.ts',
-    document: `
-      mutation CreateFirm($input: CreateFirmInput!) {
-        createFirm(input: $input) {
-          apiToken
-          onboardingToken {
-            expiresAt
-            token
-          }
-          signUpLink {
-            link
-            expiresAt
-          }
-        }
-      }
-    `,
-  },
-  {
-    name: 'CreateFirmSignUpLink',
-    source: 'src/confido-legal-requests/createFirmSignUpLink.ts',
-    document: `
-      mutation CreateFirmSignUpLink {
-        createFirmSignUpLink {
-          link
-          expiresAt
-        }
-      }
-    `,
-  },
-  {
-    name: 'CreateOnboardingToken',
-    source: 'src/confido-legal-requests/createOnboardingToken.ts',
-    document: `
-      mutation CreateOnboardingToken {
-        createOnboardingToken {
-          expiresAt
-          token
-        }
-      }
-    `,
-  },
-  {
-    // The app's own typo: the operation is named `ExchangedCodeForFirmToken`
-    // while the field is `exchangeCodeForFirmApiToken`.
-    name: 'ExchangedCodeForFirmToken',
-    source: 'src/confido-legal-requests/exchangeCodeForFirmToken.ts',
-    document: `
-      mutation ExchangedCodeForFirmToken($code: String!) {
-        exchangeCodeForFirmApiToken(code: $code)
-      }
-    `,
-  },
-  {
-    name: 'DisconnectFromPartner',
-    source: 'src/confido-legal-requests/disconnect.ts',
-    document: `
-      mutation DisconnectFromPartner {
-        disconnectFromPartner {
-          id
-        }
-      }
-    `,
-  },
-  {
-    name: 'CreatePaymentToken',
-    source: 'src/confido-legal-requests/createPaymentToken.ts',
-    document: `
-      mutation CreatePaymentToken($input: CreatePaymentTokenInput) {
-        createPaymentToken(input: $input) {
-          paymentToken
-        }
-      }
-    `,
-  },
-  {
-    name: 'CreateSavePaymentMethodToken',
-    source: 'src/confido-legal-requests/createSavePaymentMethodToken.ts',
-    document: `
-      mutation CreateSavePaymentMethodToken($input: CreateSavePaymentMethodTokenInput) {
-        createSavePaymentMethodToken(input: $input) {
-          savePaymentMethodToken
-        }
-      }
-    `,
-  },
-  {
-    name: 'PaymentSessionComplete',
-    source: 'src/confido-legal-requests/paymentSessionComplete.ts',
-    document: `
-      mutation PaymentSessionComplete($input: PaymentSessionCompleteInput!) {
-        paymentSessionComplete(input: $input) {
-          id
-          status
-          storedPaymentMethod {
-            cardBrand
-            payerName
-            paymentMethod
-            lastFour
-            id
-          }
-          transactions {
-            id
-            amountProcessed
-            payRequest {
-              externalId
-            }
-          }
-        }
-      }
-    `,
-  },
-  {
-    name: 'CompleteSavePaymentMethod',
-    source: 'src/confido-legal-requests/completeSavePaymentMethod.ts',
-    document: `
-      mutation CompleteSavePaymentMethod($input: CompleteSavePaymentMethodSessionInput!) {
-        completeSavePaymentMethod(input: $input) {
-          id
-          lastFour
-        }
-      }
-    `,
-  },
-  {
-    name: 'AddClient',
-    source: 'src/confido-legal-requests/addClient.ts',
-    document: `
-      mutation AddClient($input: AddClientInput!) {
-        addClient(input: $input) {
-          clientName
-          id
-        }
-      }
-    `,
-  },
+    });
+  return found;
+}
+
+const APP_OPERATIONS: AppOperation[] = readGqlDocuments(
+  APP_REQUESTS_DIR,
+  'src/confido-legal-requests',
+);
+
+/**
+ * Input-object fields the app sends as **variables**. No document mentions
+ * them, so `validate()` is blind to them: `createFirm` would still validate
+ * against a schema that had dropped `CreateFirmInput.mockOnboarding`, and the
+ * app would still break. Hand-maintained on purpose, each with the line that
+ * sends it.
+ */
+interface SentInputField {
+  typeName: string;
+  field: string;
+  source: string;
+}
+
+const SENT_INPUT_FIELDS: SentInputField[] = [
+  { typeName: 'CreateFirmInput', field: 'name', source: 'createFirm.ts:50' },
+  { typeName: 'CreateFirmInput', field: 'mockOnboarding', source: 'createFirm.ts:51' },
+  { typeName: 'AddClientInput', field: 'clientName', source: 'addClient.ts:40' },
+  { typeName: 'AddClientInput', field: 'firmId', source: 'addClient.ts:41' },
+  { typeName: 'PayRequestInput', field: 'externalId', source: 'pay-request-lookup.ts:31' },
+  { typeName: 'PayRequestInput', field: 'firmId', source: 'pay-request-lookup.ts:32' },
+  { typeName: 'CreatePaymentTokenInput', field: 'bankAccountId', source: 'createPaymentToken.ts:35' },
+  { typeName: 'CreatePaymentTokenInput', field: 'paymentLinkId', source: 'createPaymentToken.ts:36' },
+  { typeName: 'CreateSavePaymentMethodTokenInput', field: 'clientId', source: 'createSavePaymentMethodToken.ts:39' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'externalId', source: 'paymentSessionComplete.ts:87' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'amount', source: 'paymentSessionComplete.ts:34' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'method', source: 'paymentSessionComplete.ts:38' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'paymentSessionToken', source: 'paymentSessionComplete.ts:42' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'savePaymentMethod', source: 'paymentSessionComplete.ts:43' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'sendReceipt', source: 'paymentSessionComplete.ts:44' },
+  { typeName: 'PaymentSessionCompleteInput', field: 'surchargeEnabled', source: 'paymentSessionComplete.ts:45' },
+  { typeName: 'CompleteSavePaymentMethodSessionInput', field: 'savePaymentMethodToken', source: 'completeSavePaymentMethod.ts:22' },
+  { typeName: 'CompleteSavePaymentMethodSessionInput', field: 'paymentMethod', source: 'completeSavePaymentMethod.ts:21' },
 ];
+
+const DEAD_DOCUMENT_QUIRK =
+  'src/components/transactions/useTransactions.ts:3-9 declares `query GET_TRANSACTIONS() ' +
+  '{ transactions { } }` — an empty argument list and an empty selection set are both ' +
+  'syntax errors, and `transactions` is not a field on Query in the real SDL either. It ' +
+  'survives because `useTransactions` has no callers and gql`` only parses when evaluated, ' +
+  'so @apollo/client is a dependency for one dead file. QUIRKS.md #12.';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -289,6 +232,35 @@ const APP_OPERATIONS: AppOperation[] = [
 
 function loadMockSchema(): GraphQLSchema {
   return buildSchema(readFileSync(SCHEMA_PATH, 'utf8'));
+}
+
+/** The parsed documents, in `APP_OPERATIONS` order. Unparseable ones are dropped. */
+function parsedDocuments(): DocumentNode[] {
+  const documents: DocumentNode[] = [];
+  APP_OPERATIONS.forEach((operation) => {
+    if (operation.ast) documents.push(operation.ast);
+  });
+  return documents;
+}
+
+/**
+ * `SENT_INPUT_FIELDS` entries the schema does not have. Empty means every field
+ * the app puts in its variables still exists.
+ */
+function missingSentInputFields(schema: GraphQLSchema): string[] {
+  const missing: string[] = [];
+  SENT_INPUT_FIELDS.forEach((sent) => {
+    const type = schema.getType(sent.typeName);
+    if (!type || !isInputObjectType(type)) {
+      missing.push(`${sent.typeName} is not an input object type (sent from ${sent.source})`);
+      return;
+    }
+    const fields = type.getFields();
+    if (!Object.prototype.hasOwnProperty.call(fields, sent.field)) {
+      missing.push(`${sent.typeName}.${sent.field} is gone (sent from ${sent.source})`);
+    }
+  });
+  return missing;
 }
 
 function push(list: string[], value: string): void {
@@ -395,21 +367,47 @@ async function introspectLiveSchema(
 // Always-on, offline
 // ---------------------------------------------------------------------------
 
+/**
+ * Set by the gated test's body, checked by `afterAll`. Proves the gate really
+ * gated, rather than only proving that the predicate behind it is correct.
+ */
+let liveIntrospectionBodyRan = false;
+
 test.describe('contract drift', () => {
+  test('the 14 operation documents are read from src/, not copied into this spec', () => {
+    // Nothing in this test is a copy of the app's GraphQL: every document came
+    // off disk a few milliseconds ago. Edit a selection set in
+    // src/confido-legal-requests and the next run validates the edited one.
+    const parseFailures = APP_OPERATIONS.filter((operation) => operation.parseError !== null).map(
+      (operation) => `${operation.source}: ${operation.parseError}`,
+    );
+    expect(parseFailures, 'every gql`` document in the app must parse').toEqual([]);
+
+    const names = APP_OPERATIONS.map((operation) => operation.name);
+    expect(
+      names.slice().sort(),
+      'the operations the app sends are not the ones the mock implements',
+    ).toEqual(EXPECTED_OPERATION_NAMES.slice().sort());
+    expect(APP_OPERATIONS.length).toBe(14);
+
+    // Spot-check the provenance: a real file, a real line, real text.
+    const getFirm = APP_OPERATIONS.filter((operation) => operation.name === 'GetFirm')[0];
+    expect(getFirm.source).toBe('src/confido-legal-requests/getFirm.ts:4');
+    expect(getFirm.document).toContain('isAcceptingPayments');
+    const addClient = APP_OPERATIONS.filter((operation) => operation.name === 'AddClient')[0];
+    expect(addClient.source).toBe('src/confido-legal-requests/addClient.ts:4');
+  });
+
   test('the checked-in SDL supports all 14 operations the app sends', () => {
     const schema = loadMockSchema();
     const failures: string[] = [];
 
     APP_OPERATIONS.forEach((operation) => {
-      let document: DocumentNode;
-      try {
-        document = parse(operation.document);
-      } catch (error) {
-        failures.push(`${operation.name} (${operation.source}) does not parse: ${String(error)}`);
+      if (!operation.ast) {
+        failures.push(`${operation.source} does not parse: ${operation.parseError}`);
         return;
       }
-      const errors = validate(schema, document);
-      errors.forEach((error) => {
+      validate(schema, operation.ast).forEach((error) => {
         failures.push(`${operation.name} (${operation.source}): ${error.message}`);
       });
     });
@@ -418,9 +416,43 @@ test.describe('contract drift', () => {
     expect(APP_OPERATIONS.length).toBe(14);
   });
 
+  test('the checked-in SDL also has the input fields the app only sends as variables', () => {
+    // validate() cannot see these: `createFirm` validates fine against a schema
+    // with no `CreateFirmInput.mockOnboarding`, and the app still breaks.
+    expect(missingSentInputFields(loadMockSchema())).toEqual([]);
+    expect(SENT_INPUT_FIELDS.length).toBeGreaterThan(0);
+  });
+
+  test(
+    'the app\'s one other GraphQL document is dead and does not even parse',
+    { annotation: { type: 'quirk', description: DEAD_DOCUMENT_QUIRK } },
+    () => {
+      // Why the scan above is scoped to src/confido-legal-requests: the app has
+      // exactly one other gql`` document and it is a syntax error that survives
+      // only because nothing ever evaluates it.
+      const dead = readGqlDocuments(
+        join(__dirname, '..', '..', 'src', 'components', 'transactions'),
+        'src/components/transactions',
+      );
+
+      expect(dead.length).toBe(1);
+      expect(dead[0].source).toBe('src/components/transactions/useTransactions.ts:3');
+      expect(dead[0].parseError, 'GET_TRANSACTIONS unexpectedly parses now').toContain(
+        'Syntax Error',
+      );
+      expect(dead[0].name).toBeNull();
+
+      // …and it is not one of the 14, so it can never mask a real drift.
+      APP_OPERATIONS.forEach((operation) => {
+        expect(operation.source).not.toContain('useTransactions');
+      });
+    },
+  );
+
   test('the derived "surface we care about" really is derived from the documents', () => {
     const schema = loadMockSchema();
-    const documents = APP_OPERATIONS.map((operation) => parse(operation.document));
+    const documents = parsedDocuments();
+    expect(documents.length).toBe(14);
     const surface = usedSurface(schema, documents);
 
     // Spot-checks: one root field per token kind, one nested field, one input.
@@ -453,6 +485,22 @@ test.describe('contract drift', () => {
     );
   });
 
+  /**
+   * The truth table above only proves the predicate. This proves the *gate*:
+   * with the variable unset, the network-touching body must not have run. If
+   * someone deleted or inverted the `test.skip` below, this fails — in the same
+   * worker, right after the test that would have made the call.
+   */
+  test.afterAll(() => {
+    if (!LIVE_INTROSPECTION) {
+      expect(
+        liveIntrospectionBodyRan,
+        'the live-introspection body ran with CONFIDO_LIVE_INTROSPECT unset: the gate is ' +
+          'broken and the suite just reached the public internet',
+      ).toBe(false);
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Opt-in, needs network
   // -------------------------------------------------------------------------
@@ -475,8 +523,9 @@ test.describe('contract drift', () => {
         !LIVE_INTROSPECTION,
         'Opt-in: set CONFIDO_LIVE_INTROSPECT=1 to introspect the live Confido sandbox. ' +
           'This is a gate on a network-requiring check, not a suppressed failure — the ' +
-          'three offline tests in this file always run.',
+          'offline tests in this file always run.',
       );
+      liveIntrospectionBodyRan = true;
 
       const mockSchema = loadMockSchema();
       const liveSchema = await introspectLiveSchema(request, INTROSPECT_ENDPOINT);
@@ -508,8 +557,7 @@ test.describe('contract drift', () => {
         ),
       });
 
-      const documents = APP_OPERATIONS.map((operation) => parse(operation.document));
-      const surface = usedSurface(mockSchema, documents);
+      const surface = usedSurface(mockSchema, parsedDocuments());
 
       const relevant = breaking.filter((change) =>
         touchesUsedSurface(change.description, surface),
@@ -532,10 +580,17 @@ test.describe('contract drift', () => {
 
       // The sharper check: the app's own documents must still validate.
       const validationFailures: string[] = [];
-      APP_OPERATIONS.forEach((operation, index) => {
-        validate(liveSchema, documents[index]).forEach((error) => {
+      APP_OPERATIONS.forEach((operation) => {
+        if (!operation.ast) {
+          validationFailures.push(`${operation.source} does not parse: ${operation.parseError}`);
+          return;
+        }
+        validate(liveSchema, operation.ast).forEach((error) => {
           validationFailures.push(`${operation.name} (${operation.source}): ${error.message}`);
         });
+      });
+      missingSentInputFields(liveSchema).forEach((message) => {
+        validationFailures.push(`variables: ${message}`);
       });
 
       expect(
@@ -549,7 +604,3 @@ test.describe('contract drift', () => {
     },
   );
 });
-
-// Keeps `Kind` imported for the visitor's benefit under `isolatedModules`
-// without an unused-import warning; the value is never branched on.
-void Kind;
