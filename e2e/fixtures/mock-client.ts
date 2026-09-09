@@ -46,7 +46,7 @@ export type {
  * The payment-link id `src/pages/paylinks.tsx:24` hardcodes. Against the real
  * sandbox it belongs to the app author's account and 500s for everyone else
  * (PLAN.md §0.1); against the mock it 500s too until a test seeds it with
- * `mock.paylinks.seed(PAYLINKS_PAGE_PAYMENT_LINK_ID, 25000)`.
+ * `mock.paylinks.seedPaylinksPage(connectedUser.firmId, 25000)`.
  */
 export const PAYLINKS_PAGE_PAYMENT_LINK_ID = 'a1e7a82e-b59e-4645-b559-22e12bfb265c';
 
@@ -390,14 +390,26 @@ export class MockOnboarding {
 export class MockPaylinks {
   constructor(private readonly http: ControlTransport) {}
 
-  /** Seeds a payment link so `createPaymentToken({ paymentLinkId })` resolves. */
-  async seed(id: string, totalAmount: number): Promise<PaymentLinkRecord> {
-    return this.http.post<PaymentLinkRecord>('/__control/paylinks/seed', { id, totalAmount });
+  /**
+   * Seeds a payment link for ONE firm, so `createPaymentToken({ paymentLinkId })`
+   * resolves for that firm and keeps failing with `Paylink not found` for every
+   * other one. Links are firm-scoped precisely so parallel tests cannot collide
+   * over the single hardcoded id.
+   */
+  async seed(firmId: string, id: string, totalAmount: number): Promise<PaymentLinkRecord> {
+    return this.http.post<PaymentLinkRecord>('/__control/paylinks/seed', {
+      firmId,
+      id,
+      totalAmount,
+    });
   }
 
-  /** Seeds the id `src/pages/paylinks.tsx` hardcodes. Default total: $250.00. */
-  async seedPaylinksPage(totalAmount = 25_000): Promise<PaymentLinkRecord> {
-    return this.seed(PAYLINKS_PAGE_PAYMENT_LINK_ID, totalAmount);
+  /**
+   * Seeds the id `src/pages/paylinks.tsx:24` hardcodes, for the given firm.
+   * Default total: $250.00. Pass `connectedUser.firmId`.
+   */
+  async seedPaylinksPage(firmId: string, totalAmount = 25_000): Promise<PaymentLinkRecord> {
+    return this.seed(firmId, PAYLINKS_PAGE_PAYMENT_LINK_ID, totalAmount);
   }
 }
 

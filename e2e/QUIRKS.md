@@ -231,6 +231,39 @@ the declared field gets `undefined`. Harmless today — only `.token` is read
 
 ---
 
+## 14. The Save-Payment-Method modal has no error path, and renders nothing when the call fails
+
+For a logged-in but **unconnected** user, `POST /api/stored-payment-methods/create-token` returns
+HTTP 500 (`src/pages/api/stored-payment-methods/create-token.ts:11` casts a null `glApiToken` to
+`string` and sends it as `x-api-key`). The modal does not report this. It drops out of `Loading...`
+and then renders **nothing at all** — the dialog's entire text is `Save a Payment Method`, header plus
+close button, with no form, no error and no way to proceed.
+
+Three separate omissions line up to produce it, all in
+`src/components/stored-payment-methods/useSavePaymentMethodToken.ts`:
+
+```js
+12:  const [error, setError] = useState();          // setError is never called, anywhere
+14:  const fetchAndSaveToken = async () => {
+15:    const result = await fetch('/api/stored-payment-methods/create-token');
+16:    const json = await result.json();            // no try/catch, no result.ok check
+17:    setToken(json.token);                        // stores undefined on the error body
+18:    setLoading(false);
+19:  };
+```
+
+`fetch` does not reject on a 500, so the error body parses fine, `token` becomes `undefined` and
+`loading` becomes `false`. At `CreateStoredPaymentMethodModal.tsx:51-53` all three branches
+(`loading`, `error`, `token`) are then false and the body is empty. Line `:52`, which renders
+`error.message`, is unreachable dead code.
+
+The suite asserts the empty-dialog behaviour rather than a hang, so fixing the hook will fail the test
+loudly.
+
+*Sub-finding:* the 500 body echoes `graphql-request`'s full serialised error
+(`create-token.ts:19-20`), which embeds the GraphQL document text and variables, straight to the
+browser.
+
 ---
 
 *Entries below this line are added as Phase 2 and Phase 3 confirm them in the browser.*

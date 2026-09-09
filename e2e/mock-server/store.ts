@@ -327,14 +327,23 @@ export function listClients(): ClientRecord[] {
 // Payment links (seeded by tests via POST /__control/paylinks/seed)
 // ---------------------------------------------------------------------------
 
-export function seedPaylink(id: string, totalAmount: number): PaymentLinkRecord {
-  const record: PaymentLinkRecord = { id, totalAmount };
-  paylinks.set(id, record);
+function paylinkKey(firmId: string, id: string): string {
+  return firmId + '::' + id;
+}
+
+export function seedPaylink(
+  firmId: string,
+  id: string,
+  totalAmount: number,
+): PaymentLinkRecord {
+  const record: PaymentLinkRecord = { id, totalAmount, firmId };
+  paylinks.set(paylinkKey(firmId, id), record);
   return record;
 }
 
-export function getPaylink(id: string): PaymentLinkRecord | undefined {
-  return paylinks.get(id);
+/** Resolves only within the calling firm; another firm's link is invisible. */
+export function getPaylink(firmId: string, id: string): PaymentLinkRecord | undefined {
+  return paylinks.get(paylinkKey(firmId, id));
 }
 
 export function listPaylinks(): PaymentLinkRecord[] {

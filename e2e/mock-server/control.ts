@@ -421,17 +421,25 @@ async function handleControlApi(
     return;
   }
 
-  // POST /__control/paylinks/seed  { id, totalAmount } → PaymentLinkRecord
+  // POST /__control/paylinks/seed  { firmId, id, totalAmount } → PaymentLinkRecord
+  // Payment links are firm-scoped: seeding one firm's link leaves every other
+  // firm still seeing "Paylink not found", which is what keeps paylinks.spec's
+  // two halves from racing (PLAN.md §3.4).
   if (head === 'paylinks' && rest[1] === 'seed' && rest.length === 2) {
     if (method !== 'POST') return methodNotAllowed(res, 'POST, OPTIONS');
     const body = await readJsonBody(req);
     const id = str(body.id);
-    if (!id) throw badRequest('body must be { id: string, totalAmount?: number }');
+    const firmId = str(body.firmId);
+    if (!id || !firmId) {
+      throw badRequest('body must be { firmId: string, id: string, totalAmount?: number }');
+    }
+    if (!store.getFirm(firmId)) throw badRequest(`unknown firm ${firmId}`);
     const totalAmount = num(body.totalAmount);
     sendJson(
       res,
       200,
       store.seedPaylink(
+        firmId,
         id,
         totalAmount === undefined ? store.DEFAULT_PAYLINK_TOTAL_AMOUNT : totalAmount,
       ),

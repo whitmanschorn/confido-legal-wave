@@ -376,7 +376,7 @@ export const resolvers = {
       if (input.paymentLinkId) {
         // The real API 404s the Paylinks page's hardcoded id unless the paylink
         // exists, active firm or not (PLAN.md §0.1).
-        paymentLink = store.getPaylink(input.paymentLinkId);
+        paymentLink = store.getPaylink(firm.id, input.paymentLinkId);
         if (!paymentLink) throw businessError('Paylink not found');
       }
       if (!firmIsActive(firm)) throw businessError('no operating accounts exist');

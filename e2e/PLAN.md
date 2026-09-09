@@ -9,25 +9,37 @@ to Confido**. All work is **additive**: nothing under `src/`, `prisma/`, `public
 Verification of the additive rule, run before every commit:
 
 ```
-git status --porcelain | grep -vE '^\?\? (e2e/|\.github/)' | grep -v '^ M e2e/' ; # must print nothing
+git status --porcelain | grep -vE '^\?\? (e2e/|\.github/)' | grep -v '^ M e2e/' \
+  | grep -v '^ M tsconfig.json' ; # must print nothing
 ```
 
-### 0.0 Hard constraint discovered in Phase 0: e2e code is type-checked by `next build`
+**The one sanctioned exception** (granted by the repo owner, 2026-09-08): the root `tsconfig.json`
+may be edited, and only to add `"e2e"` to its `exclude` array. Nothing else outside `e2e/` may change.
+The diff is one line:
+
+```diff
+-  "exclude": ["node_modules"]
++  "exclude": ["node_modules", "e2e"]
+```
+
+### 0.0 Why the root `tsconfig.json` excludes `e2e`
 
 The root `tsconfig.json` has `"include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"]`, so `next build`
-type-checks everything under `e2e/` too — and we may not edit the root tsconfig. Therefore **every
-`.ts` file under `e2e/` must compile under the root config as well as under `e2e/tsconfig.json`**
-(root is `target: es5`, `moduleResolution: node`, `strict`, `isolatedModules`, no `downlevelIteration`).
+type-checks everything under `e2e/` too — under the *app's* compiler options (`target: es5`,
+`moduleResolution: node`, no `downlevelIteration`). Phase 0 and Phase 1 were written to satisfy both
+that config and `e2e/tsconfig.json` simultaneously, which meant no iterator spread over `Map`/`Set`
+and extensionless relative imports.
 
-Rules that follow, and that every unit must obey:
+In Phase 2 the repo owner granted the single exception above, so `e2e` is now excluded from the root
+config and the dual-compile constraint is lifted. Two notes:
 
-* **No iterator spread or `for…of` over a `Map`/`Set`.** Use `Array.from(map.values())` and
-  `map.forEach(...)`. (`[...map.values()]` is TS2802 under the root config.)
-* **Extensionless relative imports** (`./types`, not `./types.js`). `tsx` resolves these fine.
-* `import type` / `export type` for type-only bindings (`isolatedModules`).
-* No `for await`. Shims stay `.js` (the root `include` only matches `.ts`/`.tsx`, so they are exempt).
-* Verify with **both**: `npx tsc --noEmit` from `e2e/`, and `npx tsc --noEmit` from the repo root
-  (root output is clean; ignore nothing).
+* **The existing code still follows the old rules** — `Array.from(map.values())` rather than
+  `[...map.values()]`, extensionless relative imports. Both match what `src/` already does, so leave
+  them; there is nothing to unwind.
+* **New code may use the full `e2e/tsconfig.json` feature set** (`target: ES2022`, iterator spread,
+  `for…of` over a `Map`). Type-check with `npx tsc --noEmit` from `e2e/`. Running it from the repo
+  root no longer covers `e2e/`, which is the point: the app's build no longer depends on test code
+  compiling.
 
 If a test can only be made to pass by changing app code, **do not change the app**. Encode the
 current behaviour, tag the test with an annotation `{ type: 'quirk', description: '...' }`, and
@@ -308,9 +320,18 @@ POST /__control/connect/mint                   { name? } → creates ACTIVE firm
 GET  /__control/sessions/:token                { kind, paymentLink?, surchargingEnabled } (shim init) or 404
 POST /__control/sessions/:token/stage          body = instrument from shim submitFields
 POST /__control/onboarding/:token/submit       firm → APP_SUBMITTED
-POST /__control/paylinks/seed                  { id, totalAmount } → seeds the hardcoded Paylinks id (§0.1)
+POST /__control/paylinks/seed                  { firmId, id, totalAmount } → seeds a paylink FOR ONE FIRM (§0.1)
 GET  /healthz
 ```
+
+**Paylinks are scoped per firm** (contract revised in Phase 2). A payment link belongs to a firm, both
+in the real API and in the mock: the store keys them by `(firmId, id)`, and `createPaymentToken`
+resolves `input.paymentLinkId` only against the calling token's firm. This is what makes
+`src/pages/paylinks.tsx`'s hardcoded id 500 for everyone except the firm that owns it — the whole
+point of QUIRKS.md #7 — and it is also what lets `paylinks.spec` assert the 500 in one test and drive
+the seeded form in another **without the two racing over one global key**. Seeding globally (the
+original §3.4 shape) made those two tests mutually exclusive and order-dependent under
+`fullyParallel`.
 
 ### 3.5 Fake Confido app pages (served under `/app`, matches `NEXT_PUBLIC_CONFIDO_APP_DOMAIN`)
 

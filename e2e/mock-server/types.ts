@@ -144,6 +144,13 @@ export interface ClientRecord {
 export interface PaymentLinkRecord {
   id: string;
   totalAmount: number;
+  /**
+   * The firm that owns this link. Payment links are firm-scoped in the real API,
+   * which is exactly why the hardcoded id in src/pages/paylinks.tsx 500s for
+   * everyone but its owner (QUIRKS.md #7). Scoping them here also keeps the
+   * "unseeded 500" and "seeded form" tests from racing over one global key.
+   */
+  firmId: string;
 }
 
 /** What the hosted-fields shim POSTs to /__control/sessions/:token/stage. */
