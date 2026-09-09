@@ -103,6 +103,139 @@ re-introspects the live sandbox and diffs it against `schema.graphql`, so a mock
 drifted from reality gets caught. It needs no credentials either (introspection is open) and never
 runs in CI by default.
 
+## QA: the local TDD loop
+
+The loop you want is **servers up once, then re-run a single spec on every edit**. A full cold run
+rebuilds the app and takes ~2 minutes; a warm single-spec run takes ~2 seconds.
+
+### 1. One-time setup
+
+```bash
+npm ci                                        # repo root — the suite builds the real app
+npm --prefix e2e ci
+npx --prefix e2e playwright install chromium
+```
+
+### 2. Start the servers once and leave them up
+
+```bash
+# terminal 1 — the mock Confido API
+npm --prefix e2e run mock
+
+# terminal 2 — Legal Wave, built with the mock environment
+npm run reset-db
+CONFIDO_API_ENDPOINT=http://127.0.0.1:7002/v2 \
+CONFIDO_PARTNER_TOKEN=p_secret_mock_partner \
+NEXT_PUBLIC_CONFIDO_APP_DOMAIN=http://127.0.0.1:7002/app \
+NEXT_PUBLIC_CONFIDO_SDK_URL=http://127.0.0.1:7002/js/hosted-fields.js \
+NEXT_PUBLIC_CL_ONBOARDING_JS_URL=http://127.0.0.1:7002/js/onboarding.js \
+GL_WEBHOOK_SECRET=mock-webhook-secret \
+GL_LEGACY_WEBHOOK_SECRET=mock-legacy-secret \
+  npm run build && npm run start
+```
+
+Locally `reuseExistingServer` is on, so every `playwright test` from now on attaches to these instead
+of rebuilding. **`NEXT_PUBLIC_*` variables are inlined at build time** — if you change one, you must
+rebuild; changing it in the shell is not enough.
+
+You do not have to do this. `npm --prefix e2e test` starts both servers itself. It is just slower.
+
+### 3. The loop
+
+```bash
+cd e2e
+npx playwright test specs/payment-intents.spec.ts        # one file
+npx playwright test -g "declined"                        # one test by name
+npx playwright test specs/clients.spec.ts --headed       # watch it drive the browser
+npx playwright test specs/clients.spec.ts --debug        # step through with the inspector
+npx playwright test --ui                                 # the watch-mode UI; best for iterating
+npx playwright test --last-failed                        # re-run only what just failed
+```
+
+After a failure, the trace is the fastest way to understand it — it has a DOM snapshot, the network
+log and the console for every step:
+
+```bash
+npx playwright show-trace test-results/<test-dir>/trace.zip
+```
+
+### 4. Inspect and drive the mock by hand
+
+The control API is a normal HTTP API; `curl` works and is often quicker than a debugger.
+
+```bash
+curl -s 127.0.0.1:7002/healthz
+curl -s 127.0.0.1:7002/__control/state | jq                   # every firm, client, session, payment
+curl -s '127.0.0.1:7002/__control/events?since=0' | jq        # every GraphQL op the app sent
+curl -s '127.0.0.1:7002/__control/events?since=0&op=CreateFirm' | jq
+# `op` matches the GraphQL operationName the app sent, so an anonymous query records as null
+
+# drive state a test would drive
+curl -sX POST 127.0.0.1:7002/__control/connect/mint -H 'content-type: application/json' -d '{"name":"Demo"}'
+curl -sX POST 127.0.0.1:7002/__control/firms/<firmId>/activate
+curl -sX POST 127.0.0.1:7002/__control/firms/<firmId>/surcharging -H 'content-type: application/json' -d '{"enabled":true}'
+```
+
+`GET /__control/events` is also how the suite waits for a server-side Confido call. If you are ever
+tempted to reach for a sleep, poll this instead.
+
+You can drive the GraphQL mock directly too. There is no GraphiQL playground (it is disabled, along
+with the landing page, so the mock only ever answers as the real API would), but `curl` works — and
+the partner token is the one literal in the repo:
+
+```bash
+curl -s 127.0.0.1:7002/v2 -H 'content-type: application/json' \
+  -H 'x-api-key: p_secret_mock_partner' \
+  -d '{"query":"{ me { partner { id appId } } }"}'
+```
+
+### 5. Writing a test, red first
+
+The point of the mock is that failure states are as easy to reach as success states, so write the red
+test first and watch it fail for the reason you expect:
+
+```ts
+import { test, expect, CARDS, fillCardFields, waitForHostedFields, CARD_FIELD_KEYS,
+         runPaymentAndCaptureResponse } from '../fixtures/test';
+
+test('a declined card leaves the form untouched', async ({ page, connectedUser, mock }) => {
+  await page.goto('/payment-intents');
+  await waitForHostedFields(page, CARD_FIELD_KEYS);
+  await page.getByLabel('Amount').fill('10.00');
+  await fillCardFields(page, CARDS.declined);          // 4000300011112220
+
+  const mark = await mock.events.mark();               // take the mark BEFORE the action
+  await runPaymentAndCaptureResponse(page, () =>
+    page.getByRole('button', { name: 'Run payment' }).click());
+
+  const ev = await mock.events.waitFor({
+    op: 'PaymentSessionComplete',
+    firmId: connectedUser.firmId,                      // always scope to your own firm
+    since: mark,
+  });
+  expect(ev.ok).toBe(false);
+  await expect(page.getByRole('heading', { name: 'Success!' })).toHaveCount(0);
+});
+```
+
+Fixtures do the setup: `user` (signed up), `connectedUser` (connected, ACTIVE firm), `pendingFirmUser`
+(firm not accepting payments). `lockdown` and `shims` are automatic. Read `fixtures/test.ts` and
+`fixtures/mock-client.ts` — they are commented and beat guessing.
+
+### 6. Things that will bite you
+
+| Symptom | Cause |
+|---|---|
+| Playwright starts rebuilding the app | Your `npm run start` died, or you set `CI=1` |
+| A `NEXT_PUBLIC_*` change has no effect | Inlined at build time — rebuild |
+| A test passes alone and fails in the suite | An unscoped `mock.events` assertion; scope it by `firmId` |
+| `strict mode violation: resolved to 2 elements` | `Ready`/`Pending` need `{ exact: true }` |
+| Bogus `ENOENT … trace.zip` failures | Two Playwright runs sharing `test-results/`; pass `--output=/tmp/<name>` |
+| A spinner never clears | The shim never got its session — check `GET /__control/sessions/<token>` |
+
+Never use `waitForTimeout`, and never call `POST /__control/reset` while anything else is running —
+the store is shared by all workers. Tests isolate by creating a fresh user and firm, not by resetting.
+
 ## Adding a scenario
 
 1. Add state and behaviour to the mock if you need it: a store record in `mock-server/store.ts`, a
@@ -123,6 +256,62 @@ runs in CI by default.
    fail at all. Both bugs existed in this suite and were caught by the Phase 2 audit.
 7. Ask what would make your new test fail. A test asserting only that an event fired, or that an
    element that was always present is visible, is not testing the change the action caused.
+
+## Deploying this (and why there is no live URL yet)
+
+There is deliberately **no Vercel deployment**. Legal Wave cannot run on Vercel without changes to the
+app itself, and this branch's value is that it changes nothing. Both blockers are real and independent
+— neither is a configuration detail:
+
+**1. The database is a SQLite file, and Vercel's runtime filesystem is read-only.**
+
+```prisma
+datasource db {
+  provider = "sqlite"
+  url      = "file:./legal-wave.sqlite"
+}
+```
+
+`prisma db push` runs at build time and would produce a file inside the bundle, so the app *builds*.
+But six routes write at runtime — `prisma.user.create` in `src/pages/api/signup.ts:12`, plus firm
+updates in `disconnect.ts:22`, `get-sign-up-link.ts:27`, `gravity-callback.ts:24`, `session.ts:46`,
+`create-onboarding-code.ts:26`. Signing up is the first thing a visitor does, and it fails
+immediately. Fixing this means editing `prisma/schema.prisma` to a hosted datasource (Vercel Postgres,
+Neon, Turso) and running a migration — a change outside `e2e/`.
+
+**2. There is no Confido backend to point it at.**
+
+`src/pages/index.tsx:12` calls `getMyPartner()` inside `getServerSideProps`, so the home page needs a
+reachable API and a valid `CONFIDO_PARTNER_TOKEN` before it renders anything. Two ways to satisfy it:
+
+* **Real sandbox credentials.** Then the deploy is a normal Legal Wave install, and this suite is not
+  involved.
+* **Host the mock.** `mock-server/` is a plain Node HTTP server and would run fine on any always-on
+  box (Fly, Railway, Render); point `CONFIDO_API_ENDPOINT`, `NEXT_PUBLIC_CONFIDO_APP_DOMAIN` and the
+  two SDK URLs at it. **It will not work as Vercel serverless functions**: `store.ts` keeps all state
+  in module-level `Map`s, so every invocation would see a different, empty store. Making it
+  serverless-safe means giving the store a real persistence layer first.
+
+So a working public demo needs a hosted database *and* a hosted mock. Neither is hard; both are
+outside the scope of "add a test suite without touching the app", which is why they are written down
+here rather than done.
+
+### If you decide to deploy anyway
+
+```bash
+npx vercel login
+npx vercel link
+npx vercel env add CONFIDO_API_ENDPOINT           # ...and the other five from `Run it` above
+npx vercel --prod
+npx vercel git connect                            # auto-deploy on push to main
+```
+
+`vercel git connect` is what wires GitHub → Vercel so `main` deploys automatically; it needs the
+project linked and the repo connected to the same Vercel account. Expect the deployment to build and
+then 500 on `/` and `/api/signup` until both blockers above are addressed.
+
+Note that the e2e suite does **not** need any of this. It builds and runs the app locally against the
+local mock, which is the entire point.
 
 ## The one file changed outside `e2e/`
 
