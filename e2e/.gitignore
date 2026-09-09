@@ -2,5 +2,7 @@ node_modules
 test-results
 test-results-*
 playwright-report
+artifacts-results
+artifacts-report
 blob-report
 .playwright

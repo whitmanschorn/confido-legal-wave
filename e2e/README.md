@@ -73,6 +73,34 @@ CONFIDO_LIVE_INTROSPECT=1 npm --prefix e2e test -- specs/contract-drift.spec.ts
 For the edit-run-edit loop, see [QA: the local TDD loop](#qa-the-local-tdd-loop) — starting the
 servers once yourself turns a 2-minute run into a 2-second one.
 
+### Watching the tests run
+
+The default config keeps artifacts only on failure — right for CI, but it means a green run leaves
+nothing to look at. `playwright.artifacts.config.ts` forces video, a full-page screenshot and a trace
+for **every** test and emits the browsable HTML report:
+
+```bash
+cd e2e
+npx playwright test --config playwright.artifacts.config.ts \
+  specs/auth.spec.ts specs/home-connect.spec.ts specs/home-signup-link.spec.ts \
+  specs/home-onboarding.spec.ts specs/payment-intents.spec.ts specs/paylinks.spec.ts \
+  specs/stored-payment-methods.spec.ts specs/clients.spec.ts specs/transactions.spec.ts \
+  specs/owner-form.spec.ts specs/standing-link.spec.ts
+
+npx playwright show-report artifacts-report
+```
+
+That is 79 of the 120 tests — the ones that drive a browser. `webhooks`, `api-routes` and
+`contract-drift` are request-only and would record empty videos, so leave them out.
+
+Everything else is inherited from `playwright.config.ts`, so what you are watching is the suite that
+runs in CI, not a special-cased rerun. Expect ~90 MB of artifacts and a slower run; that is why it is
+opt-in. Both output directories (`artifacts-report/`, `artifacts-results/`) are gitignored.
+
+The trace is the most useful of the three: it carries a DOM snapshot, the network log and the console
+for every step, so you can scrub the timeline and see exactly what the page looked like when an
+assertion ran.
+
 ### If it doesn't work
 
 | Symptom | Fix |
