@@ -20,11 +20,33 @@
   if (window.confidoOnboarding) return;
 
   var DEFAULT_MOCK_URL = 'http://127.0.0.1:7002';
+  /**
+   * Origin of the <script src> that loaded this shim, captured at load time —
+   * `document.currentScript` is only non-null while the script body is running,
+   * so it cannot be read lazily from inside a callback.
+   *
+   * This matters whenever the mock is not on 127.0.0.1:7002: a shim served from
+   * an origin should talk to that origin. Without it, a browser on any other
+   * machine (a tunnelled or hosted demo) would send its control-API calls to
+   * *its own* localhost and the payment would hang.
+   */
+  var SCRIPT_ORIGIN = (function () {
+    try {
+      var el = document.currentScript;
+      if (el && el.src) return new URL(el.src, window.location.href).origin;
+    } catch (e) {
+      /* older browsers, or a shim evaluated without a script element */
+    }
+    return null;
+  })();
+
   var CONTAINER_POLL_MS = 25;
   var CONTAINER_POLL_TRIES = 80; // ~2s
 
   function mockUrl() {
-    return window.__CONFIDO_MOCK_URL || DEFAULT_MOCK_URL;
+    // Precedence: the fixture's explicit global, then the origin this script was
+    // served from, then the local default. See hosted-fields.js for why.
+    return window.__CONFIDO_MOCK_URL || SCRIPT_ORIGIN || DEFAULT_MOCK_URL;
   }
 
   /**
