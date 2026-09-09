@@ -4,14 +4,17 @@ A Playwright suite that exercises every user-facing and API-route behaviour of L
 **local mock of the Confido GraphQL API**. It passes on a clean clone with **no Confido credentials
 and no network access to Confido**.
 
-**103 tests across 16 spec files.** A cold run — wiped database, fresh `next build`, both servers
-started from scratch — is 102 passed, 1 skipped, in about two minutes. The single skip is the
+**120 tests across 16 spec files.** A cold run — wiped database, fresh `next build`, both servers
+started from scratch — is 119 passed, 1 skipped, in about two minutes. The single skip is the
 opt-in live-introspection check described under *Proving it is credential-free*.
 
 Beyond the app code itself, exactly one line changes outside `e2e/`; see *The one file changed
-outside `e2e/`* below. The suite also produced [`QUIRKS.md`](./QUIRKS.md) — 19 app behaviours it had
-to encode rather than fix, each reproduced and cited to `file:line`. That document is a deliverable in
-its own right; start with #15, #2 and #10.
+outside `e2e/`* below. The suite also produced [`QUIRKS.md`](./QUIRKS.md) — **26 app behaviours** it
+had to encode rather than fix, each reproduced and cited to `file:line`. That document is a
+deliverable in its own right; start with the five marked High: #15 (loading the home page silently
+creates a Confido firm), #21 (the app server-renders nothing), #2 (the session endpoint returns the
+plaintext password and the Confido firm secret), #10 (Connect never round-trips a `state` parameter)
+and #25 (the standing-link page frames any URL a query parameter names).
 
 ## Run it
 
@@ -113,6 +116,13 @@ runs in CI by default.
    over `/__control/events`.
 5. If the test can only pass by changing the app, don't. Assert the current behaviour, annotate the
    test `{ type: 'quirk', description: '...' }`, and add an entry to [`QUIRKS.md`](./QUIRKS.md).
+6. **Scope every `mock.events` assertion.** The mock store is shared by all workers, so
+   `mock.events.list({ since })` without a `firmId` (or another value unique to your test) will pass
+   or fail depending on what else is running. A negative assertion — "this operation did *not*
+   happen" — is the dangerous case: unscoped, it fails randomly; scoped to the wrong id, it can never
+   fail at all. Both bugs existed in this suite and were caught by the Phase 2 audit.
+7. Ask what would make your new test fail. A test asserting only that an event fired, or that an
+   element that was always present is visible, is not testing the change the action caused.
 
 ## The one file changed outside `e2e/`
 
