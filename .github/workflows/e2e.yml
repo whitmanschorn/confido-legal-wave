@@ -1,0 +1,78 @@
+# End-to-end suite for Legal Wave.
+#
+# The point of this workflow is what it does NOT have: no secrets, no
+# environment protection, no Confido credentials of any kind. Everything the
+# app talks to is mocked locally (e2e/mock-server), so this runs green on a
+# fork that has never been given access to anything.
+#
+# If you are reviewing this and want to check that claim: search this file for
+# `secrets.` — there are no uses.
+
+name: e2e
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first; these runs build the app.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  playwright:
+    name: Playwright (mocked Confido API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            e2e/package-lock.json
+
+      # The suite builds and runs the real app, so the root deps are required.
+      # postinstall runs `prisma db push`, which creates the SQLite file.
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Install suite dependencies
+        run: npm ci --prefix e2e
+
+      - name: Install Chromium
+        run: npx --prefix e2e playwright install --with-deps chromium
+
+      # CI=1 is set by GitHub Actions, which makes playwright.config.ts refuse to
+      # reuse a server and forbid test.only. The webServer entry resets the
+      # database, runs `next build` with the mock environment, and starts both
+      # servers on 127.0.0.1.
+      - name: Run the suite
+        run: npm --prefix e2e test
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: e2e/test-results
+          retention-days: 7
+          if-no-files-found: ignore
