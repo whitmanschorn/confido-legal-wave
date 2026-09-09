@@ -73,7 +73,14 @@ export interface LockdownController {
   readonly forwarded: ForwardedRequest[];
   /** `forwarded.length`. */
   forwardCount(): number;
-  /** `escaped.length`. */
+  /**
+   * `escaped.length` — **including** the benign third-party avatars the Chakra
+   * template requests (`bit.ly`, and the `tinyurl` image at
+   * `src/components/layout/Sidebar.tsx:68`). Those are aborted on every
+   * authenticated page, so this is NOT a "nothing leaked" assertion and will be
+   * non-zero on a perfectly clean run. Use `offendingEscapes()` for that, or
+   * `escapedCount()` only inside a `strictNetworkIsolation` test.
+   */
   escapedCount(): number;
   /** The escapes that will fail the test at teardown, given the current mode. */
   offendingEscapes(): EscapedRequest[];

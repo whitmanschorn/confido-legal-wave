@@ -4,8 +4,14 @@ A Playwright suite that exercises every user-facing and API-route behaviour of L
 **local mock of the Confido GraphQL API**. It passes on a clean clone with **no Confido credentials
 and no network access to Confido**.
 
-Everything here is additive. No file outside `e2e/` (and `.github/workflows/e2e.yml`) is modified, so
-this can be merged without touching the app.
+**103 tests across 16 spec files.** A cold run — wiped database, fresh `next build`, both servers
+started from scratch — is 102 passed, 1 skipped, in about two minutes. The single skip is the
+opt-in live-introspection check described under *Proving it is credential-free*.
+
+Beyond the app code itself, exactly one line changes outside `e2e/`; see *The one file changed
+outside `e2e/`* below. The suite also produced [`QUIRKS.md`](./QUIRKS.md) — 19 app behaviours it had
+to encode rather than fix, each reproduced and cited to `file:line`. That document is a deliverable in
+its own right; start with #15, #2 and #10.
 
 ## Run it
 
@@ -108,14 +114,25 @@ runs in CI by default.
 5. If the test can only pass by changing the app, don't. Assert the current behaviour, annotate the
    test `{ type: 'quirk', description: '...' }`, and add an entry to [`QUIRKS.md`](./QUIRKS.md).
 
-## A constraint worth knowing
+## The one file changed outside `e2e/`
 
-The root `tsconfig.json` has `"include": ["**/*.ts"]`, so `next build` type-checks this directory too,
-under the app's `target: es5` config — and we may not edit that tsconfig. Every `.ts` file here must
-therefore compile under **both** configs. In practice: use `Array.from(map.values())` rather than
-`[...map.values()]`, and extensionless relative imports. Both match what `src/` already does. Verify
-with `npx tsc --noEmit` from `e2e/` *and* from the repo root. (The shims are `.js`, which the root
-`include` does not match, so they are exempt.)
+`tsconfig.json` — one line:
+
+```diff
+-  "exclude": ["node_modules"]
++  "exclude": ["node_modules", "e2e"]
+```
+
+The root config's `"include": ["**/*.ts"]` otherwise makes `next build` type-check this directory
+under the *app's* compiler options (`target: es5`), which couples the app's build to the test code.
+Excluding `e2e` decouples them. Type-check the suite with `npx tsc --noEmit` from `e2e/`.
+
+Everything else in this branch is a new file under `e2e/`. To verify that:
+
+```bash
+git status --porcelain | grep -vE '^\?\? (e2e/|\.github/)' | grep -v '^ M e2e/' \
+  | grep -v '^ M tsconfig.json'   # prints nothing
+```
 
 ## Layout
 

@@ -9,6 +9,34 @@ of this repo; the commands are included so they can be re-run.
 Status legend: **confirmed** = reproduced with the output shown. **observed in-browser** = seen in a
 Playwright run rather than with curl.
 
+
+## Index
+
+Severity is our read, not the maintainers'. "High" means it can cost money, leak a
+credential, or take an action the user did not ask for.
+
+| # | Severity | Quirk |
+|---|---|---|
+| 1 | Medium | [`res.send(<number>)` sends HTTP 200 with the number as the body](#1-ressendnumber-sends-http-200-with-the-number-as-the-body) |
+| 2 | **High** | [`GET /api/session` returns the user's plaintext password and the Confido firm secret](#2-get-apisession-returns-the-users-plaintext-password-and-the-confido-firm-secret) |
+| 3 | Medium | [Routes that skip `requireAuth` render for logged-out visitors, then crash on the client](#3-routes-that-skip-requireauth-render-for-logged-out-visitors-then-crash-on-the-client) |
+| 4 | Low | [`getSessionFromRequestOrThrow` surfaces as a bare 500](#4-getsessionfromrequestorthrow-surfaces-as-a-bare-500) |
+| 5 | Low | [`createSavePaymentMethodToken` passes an options object where variables belong](#5-createsavepaymentmethodtoken-passes-an-options-object-where-variables-belong) |
+| 6 | Low | [The Paylinks form dereferences `paymentLink` without a guard](#6-the-paylinks-form-dereferences-paymentlink-without-a-guard) |
+| 7 | Medium | [The Paylinks page 500s for everyone: the payment link id is hardcoded](#7-the-paylinks-page-500s-for-everyone-the-payment-link-id-is-hardcoded) |
+| 8 | Low | [The SDK type declarations reference types that do not exist](#8-the-sdk-type-declarations-reference-types-that-do-not-exist) |
+| 9 | Low | [Non-null assertions on surcharging fields the interface says may be null](#9-non-null-assertions-on-surcharging-fields-the-interface-says-may-be-null) |
+| 10 | **High** | [The Connect flow never round-trips a `state` parameter](#10-the-connect-flow-never-round-trips-a-state-parameter) |
+| 11 | Medium | [`/api/gravity-callback` has no error handling, so a reused code 500s](#11-apigravity-callback-has-no-error-handling-so-a-reused-code-500s) |
+| 12 | Low | [A dead GraphQL document that does not parse](#12-a-dead-graphql-document-that-does-not-parse) |
+| 13 | Low | [Typo makes a response field unreachable](#13-typo-makes-a-response-field-unreachable) |
+| 14 | Medium | [The Save-Payment-Method modal has no error path, and renders nothing when the call fails](#14-the-save-payment-method-modal-has-no-error-path-and-renders-nothing-when-the-call-fails) |
+| 15 | **High** | [Loading the home page silently creates a Confido firm](#15-loading-the-home-page-silently-creates-a-confido-firm) |
+| 16 | Medium | [A declined payment shows the user nothing at all](#16-a-declined-payment-shows-the-user-nothing-at-all) |
+| 17 | Medium | [`/payment-intents` 500s for a logged-in but unconnected user](#17-payment-intents-500s-for-a-logged-in-but-unconnected-user) |
+| 18 | Medium | [The Paylinks form has no success state, so a successful payment makes it vanish](#18-the-paylinks-form-has-no-success-state-so-a-successful-payment-makes-it-vanish) |
+| 19 | Medium | [Webhook signatures are verified against a re-serialised body, not the raw bytes](#19-webhook-signatures-are-verified-against-a-re-serialised-body-not-the-raw-bytes) |
+
 ---
 
 ## 1. `res.send(<number>)` sends HTTP 200 with the number as the body
@@ -264,6 +292,104 @@ loudly.
 (`create-token.ts:19-20`), which embeds the GraphQL document text and variables, straight to the
 browser.
 
+## 15. Loading the home page silently creates a Confido firm
+
+**This is the most consequential finding in this file.** A brand-new user who merely *loads* `/` and
+clicks nothing gets a real Confido firm provisioned and its API token persisted.
+
+The chain:
+
+1. `src/components/home/ConnectionOptionsSplash.tsx:154` and
+   `src/components/home/GravityLegalConnectStatus.tsx:109` both render `<OnboardingFormModal>`
+   **unconditionally** — the `isOpen` prop only controls whether the Chakra `Modal` paints, not
+   whether the component mounts.
+2. `src/components/onboarding-form/OnboardingFormModal.tsx:37-39` runs `fetchToken()` in a mount
+   effect with **no `isOpen` guard**, so it fires on every home-page render.
+3. `fetchToken` POSTs `/api/onboarding/create-onboarding-code`.
+4. `src/pages/api/onboarding/create-onboarding-code.ts:22-32`: with no `glApiToken` stored, that route
+   calls `createFirm(...)` and writes the returned token into the database.
+
+Reproduced against a local build (`e2e/` scratch script, browser, no clicks — just `page.goto('/')`):
+
+```
+signup: 200
+BEFORE visiting /  -> glApiToken = null
+AFTER  visiting /  -> glApiToken = "f_secret_mock_14584d24-a75a-4ac4-af61-16c90234b954"
+AFTER  visiting /  -> glFirm     = {"id":"14584d24-…","isAcceptingPayments":false,"name":"Side Effect Firm"}
+Confido operations triggered by merely loading /:
+    GetMyPartner ok=true
+    CreateFirm ok=true
+    GetFirm ok=true
+```
+
+**Why it matters.** The whole point of that screen is to let the user *choose* between Connect (for an
+existing Confido account), Sign Up Link, and Onboarding.js. The choice has already been made for them
+before they read it. Concretely:
+
+* A user who lands on `/` and refreshes now sees `Connected to Confido Legal ✅` and `Pending` without
+  ever having agreed to anything.
+* A firm that intended to **Connect** an existing Confido account has already had a second, empty firm
+  created against the partner account.
+* Every unconnected home-page load of a fresh account is a `createFirm` against the live API.
+
+The suite pins the behaviour in `home-signup-link.spec.ts:59` and `home-onboarding.spec.ts:101`, which
+is also why those specs cannot assert "no Confido call happened on page load".
+
+## 16. A declined payment shows the user nothing at all
+
+`src/components/payment-intents/PaymentForm.tsx:107-109`:
+
+```js
+if (response.ok) {
+  setResult(await response.json());
+}
+```
+
+There is no `else`. A non-OK `/api/complete-payment` response is not an exception, so the `catch` at
+`:112` never runs and nothing ever calls `setError`. The form sits there, untouched, with no message —
+identical to the state before the click. The user cannot tell a declined card from a click that did
+not register.
+
+Asserted for both card (`payment-intents.spec.ts:432`) and ACH (`:391`) declines: no `Success!`
+appears, no error appears, and only the mock's event log records the failure.
+
+## 17. `/payment-intents` 500s for a logged-in but unconnected user
+
+`src/pages/payment-intents.tsx:22` casts a null `Firm.glApiToken` to `string` and hands it to
+`createPaymentToken` inside `getServerSideProps`, which has no `try`/`catch`. The Confido call fails
+on the invalid key and Next answers a bare 500 instead of redirecting the user home to connect.
+
+Pinned at `payment-intents.spec.ts:657`. `/paylinks` fails the same way for the additional reason in
+quirk #7.
+
+## 18. The Paylinks form has no success state, so a successful payment makes it vanish
+
+`src/components/paylinks/PaylinkPaymentForm.tsx` declares `export interface PaymentResult {}` (`:38`)
+— an empty type — and renders only `{!result && (…)}` (`:119`). There is no `{result && …}` branch.
+
+So a *successful* payment through `/paylinks` sets `result`, which unmounts the form and renders
+nothing: no `Success!` heading, no result JSON, no receipt, no confirmation of any kind. The user is
+left on a blank panel having just been charged. Compare `PaymentForm.tsx:159-190`, which does render a
+full success card.
+
+Pinned at `paylinks.spec.ts:114`.
+
+## 19. Webhook signatures are verified against a re-serialised body, not the raw bytes
+
+`src/pages/api/accept-webhook.ts:14` hashes `JSON.stringify(req.body)` — Next's *parsed* body, then
+re-serialised — rather than the raw request bytes. HMAC verification is supposed to run over exactly
+what the sender signed.
+
+Consequences, all asserted in `webhooks.spec.ts`:
+
+* Whitespace differences in the sender's payload are invisible: a body signed with pretty-printing
+  still verifies, because both sides collapse to `JSON.stringify` output (`webhooks.spec.ts:140`).
+* Key **order** does matter, because `JSON.stringify` preserves insertion order — so a sender that
+  reorders keys between signing and sending fails verification (`:171`).
+
+That combination is backwards from what a signature is for: it tolerates a difference that should
+invalidate the payload, while breaking on a difference that a JSON-object sender may legitimately
+introduce. Both endpoints share the flaw (`legacy-accept-webhook.ts:14`).
+
 ---
 
-*Entries below this line are added as Phase 2 and Phase 3 confirm them in the browser.*
